@@ -43,6 +43,8 @@ type AngleAdjustResult = {
 };
 
 function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
+  // OpenLayers polygon ring is closed (first point repeated at the end).
+  // Angle calculations are easier with a non-duplicated vertex list.
   const outerRing = polygon.getCoordinates()[0] ?? [];
   if (outerRing.length < 2) {
     return [...outerRing];
@@ -205,6 +207,7 @@ function numericJacobian(
   }
 
   const jacobian = baseResidual.map(() => new Array<number>(variables.length).fill(0));
+  // Numerical differentiation for each variable column.
   for (let column = 0; column < variables.length; column += 1) {
     const plus = [...variables];
     const minus = [...variables];
@@ -231,6 +234,7 @@ function solveLinearSystem(matrix: number[][], vector: number[]): number[] | nul
   const size = vector.length;
   const augmented = matrix.map((row, index) => [...row, vector[index]]);
 
+  // Gauss-Jordan elimination with partial pivoting.
   for (let pivotIndex = 0; pivotIndex < size; pivotIndex += 1) {
     let maxRow = pivotIndex;
     let maxValue = Math.abs(augmented[pivotIndex][pivotIndex]);
@@ -296,6 +300,8 @@ function solveRightAngleConstraints(
     return computeConstraintResiduals(candidateRing, targetIndices);
   };
 
+  // Levenberg-Marquardt style loop:
+  // minimize angle residuals while keeping deformation small.
   for (let iteration = 0; iteration < MAX_SOLVER_ITERATIONS; iteration += 1) {
     const residual = residualFunction(variables);
     if (residual.some((value) => !Number.isFinite(value))) {
@@ -384,6 +390,7 @@ function fallbackIterativeAdjust(
   targetIndices: number[],
   tolerance: number
 ): Coordinate[] | null {
+  // Conservative fallback when the nonlinear solver fails.
   const ring = baseRing.map((coord) => [coord[0], coord[1]] as Coordinate);
 
   for (let iteration = 0; iteration < MAX_FALLBACK_ITERATIONS; iteration += 1) {
@@ -503,6 +510,7 @@ export function adjustPolygonAnglesToRight(
       continue;
     }
 
+    // First try simultaneous constrained solve; fallback to iterative adjustment.
     const solvedRing =
       solveRightAngleConstraints(ring, targetIndices, TARGET_TOLERANCE) ??
       fallbackIterativeAdjust(ring, targetIndices, TARGET_TOLERANCE);

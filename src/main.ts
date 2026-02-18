@@ -42,6 +42,7 @@ adjustAnglesButton.addEventListener("click", () => {
   minAngleInput.value = minAngle.toString();
   maxAngleInput.value = maxAngle.toString();
 
+  // Apply to all polygons currently stored in the vector source.
   const result = adjustPolygonAnglesToRight(vectorSource, minAngle, maxAngle);
   if (result.updatedVertices === 0) {
     setStatus("조건에 맞는 꼭지점 없음");
