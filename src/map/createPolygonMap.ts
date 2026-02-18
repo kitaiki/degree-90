@@ -12,6 +12,12 @@ import type Feature from "ol/Feature";
 import type Polygon from "ol/geom/Polygon";
 import type { StyleFunction } from "ol/style/Style";
 
+/**
+ * 폴리곤/라벨 기본 렌더 스타일 정의.
+ * - polygonBaseStyle: 면/외곽선
+ * - vertexMarker: 꼭지점 마커
+ * - angleTextFill/Stroke: 각도 라벨 가독성(외곽선 포함)
+ */
 const polygonFill = new Fill({ color: "rgba(0, 153, 255, 0.22)" });
 const polygonStroke = new Stroke({ color: "#005fa3", width: 2 });
 const vertexMarker = new CircleStyle({
@@ -25,6 +31,15 @@ const polygonBaseStyle = new Style({
   fill: polygonFill,
   stroke: polygonStroke
 });
+
+/**
+ * 각도 보정 엔진 파라미터.
+ * - TARGET_ANGLE: 목표 내각(직각)
+ * - TARGET_TOLERANCE: 목표 허용 오차(도 단위)
+ * - REGULARIZATION_WEIGHT: 원형상에서 과도하게 벗어나는 해를 억제
+ * - NUMERIC_DIFF_STEP: 수치 Jacobian 계산용 미소 변화량
+ * - MAX_*_ITERATIONS: solver/fallback 최대 반복 횟수
+ */
 const TARGET_ANGLE = 90;
 const TARGET_TOLERANCE = 0.001;
 const REGULARIZATION_WEIGHT = 1e-6;
@@ -42,9 +57,12 @@ type AngleAdjustResult = {
   updatedVertices: number;
 };
 
+/**
+ * OpenLayers Polygon 외곽 링에서 중복 폐합점을 제거한다.
+ * OpenLayers는 링 끝에 시작점을 한 번 더 넣는 표현을 사용하므로,
+ * 각도 계산에서는 마지막 중복 점을 제거한 배열이 다루기 쉽다.
+ */
 function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
-  // OpenLayers 폴리곤 링은 마지막에 시작점이 한 번 더 들어간 폐합 구조다.
-  // 각도 계산은 중복 꼭지점이 없는 배열에서 처리하는 것이 안정적이다.
   const outerRing = polygon.getCoordinates()[0] ?? [];
   if (outerRing.length < 2) {
     return [...outerRing];
@@ -56,6 +74,13 @@ function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
   return isClosed ? outerRing.slice(0, -1) : [...outerRing];
 }
 
+/**
+ * 세 점(prev-current-next)에서 current의 내각(0~180)을 계산한다.
+ * - BA, BC 벡터를 만들고
+ * - dot(BA,BC) / (|BA||BC|) -> acos 로 각도 변환
+ * - 부동소수 오차 방지를 위해 cosine을 [-1,1]로 clamp
+ * 길이가 0인 벡터(중복점 등)는 각도를 정의할 수 없으므로 null 반환.
+ */
 function calculateInteriorAngle(
   prev: Coordinate,
   current: Coordinate,
@@ -78,6 +103,10 @@ function calculateInteriorAngle(
   return Number.isFinite(angle) ? angle : null;
 }
 
+/**
+ * 링을 OpenLayers 좌표 형식(폐합 포함)으로 되돌린다.
+ * 예: [A,B,C] -> [A,B,C,A]
+ */
 function createClosedRing(ring: Coordinate[]): Coordinate[] {
   if (ring.length === 0) {
     return [];
@@ -85,10 +114,20 @@ function createClosedRing(ring: Coordinate[]): Coordinate[] {
   return [...ring, [...ring[0]]];
 }
 
+/** 범위 비교 유틸(경계 포함). */
 function inRange(value: number, min: number, max: number): boolean {
   return value >= min && value <= max;
 }
 
+/**
+ * 한 꼭지점을 "직각 제약에 가까운 위치"로 이동시키는 기하 유틸.
+ *
+ * 아이디어:
+ * - A(prev), C(next)를 지름 양끝으로 보는 원 위의 임의 점 B는 ∠ABC=90°를 만족한다.
+ * - 따라서 AC의 중점/반지름으로 원을 만들고, 현재 B를 그 원 위로 투영한다.
+ * - 중심과 current가 일치하는 특수 케이스는 AC 수직 방향의 후보 2개 중
+ *   current와 더 가까운 점을 선택한다.
+ */
 function moveVertexToRightAngle(
   prev: Coordinate,
   current: Coordinate,
@@ -124,6 +163,7 @@ function moveVertexToRightAngle(
   return distanceA <= distanceB ? candidateA : candidateB;
 }
 
+/** 링 인덱스의 내각을 순환 인덱싱으로 계산한다. */
 function getAngleAtIndex(ring: Coordinate[], index: number): number | null {
   const length = ring.length;
   const prev = ring[(index - 1 + length) % length];
@@ -132,6 +172,12 @@ function getAngleAtIndex(ring: Coordinate[], index: number): number | null {
   return calculateInteriorAngle(prev, current, next);
 }
 
+/**
+ * 범위 매칭 대상 꼭지점 인덱스를 수집한다.
+ * 조건:
+ * - 내각 θ 가 [min,max] 이거나
+ * - 외각 (360-θ) 가 [min,max]
+ */
 function collectTargetVertexIndices(ring: Coordinate[], min: number, max: number): number[] {
   const indices: number[] = [];
   for (let index = 0; index < ring.length; index += 1) {
@@ -147,6 +193,10 @@ function collectTargetVertexIndices(ring: Coordinate[], min: number, max: number
   return indices;
 }
 
+/**
+ * 최적화 변수로 둘 꼭지점 인덱스를 만든다.
+ * 정책: 대상 꼭지점 + 양 옆 인접 꼭지점만 이동 허용.
+ */
 function buildVariableIndexMap(ringLength: number, targetIndices: number[]): number[] {
   const selected = new Set<number>();
   for (const index of targetIndices) {
@@ -157,6 +207,10 @@ function buildVariableIndexMap(ringLength: number, targetIndices: number[]): num
   return [...selected].sort((a, b) => a - b);
 }
 
+/**
+ * 변수 벡터([x0,y0,x1,y1,...])를 링 좌표에 반영해 후보 링을 만든다.
+ * baseRing은 고정 기준, movableIndices에 해당하는 점만 치환한다.
+ */
 function applySolvedCoordinates(
   baseRing: Coordinate[],
   movableIndices: number[],
@@ -172,6 +226,11 @@ function applySolvedCoordinates(
   return candidate;
 }
 
+/**
+ * 제약 잔차 벡터 r 를 만든다.
+ * 각 대상 i에 대해 r_i = angle_i - 90.
+ * solver는 이 잔차의 제곱합을 최소화한다.
+ */
 function computeConstraintResiduals(ring: Coordinate[], targetIndices: number[]): number[] {
   return targetIndices.map((index) => {
     const angle = getAngleAtIndex(ring, index);
@@ -182,6 +241,7 @@ function computeConstraintResiduals(ring: Coordinate[], targetIndices: number[])
   });
 }
 
+/** 배열의 절댓값 최댓값(norm-infinity)을 계산한다. */
 function computeMaxAbs(values: number[]): number {
   let maxAbs = 0;
   for (const value of values) {
@@ -193,10 +253,17 @@ function computeMaxAbs(values: number[]): number {
   return maxAbs;
 }
 
+/** 제곱합(norm-2 squared) 계산 유틸. */
 function sumSquares(values: number[]): number {
   return values.reduce((sum, value) => sum + value * value, 0);
 }
 
+/**
+ * 수치 Jacobian 계산.
+ * 각 변수 x_j에 대해 중앙차분:
+ *   d r_i / d x_j ≈ (r_i(x+h) - r_i(x-h)) / (2h)
+ * 해석적 미분을 직접 전개하지 않고 안정적으로 Jacobian을 얻기 위함.
+ */
 function numericJacobian(
   variables: number[],
   residualFunction: (candidate: number[]) => number[]
@@ -207,7 +274,6 @@ function numericJacobian(
   }
 
   const jacobian = baseResidual.map(() => new Array<number>(variables.length).fill(0));
-  // 각 변수 축마다 수치 미분으로 Jacobian 열을 계산한다.
   for (let column = 0; column < variables.length; column += 1) {
     const plus = [...variables];
     const minus = [...variables];
@@ -230,11 +296,15 @@ function numericJacobian(
   return jacobian;
 }
 
+/**
+ * 선형계 Ax=b 풀이 (Gauss-Jordan + partial pivoting).
+ * normal equation 풀이에 사용한다.
+ * 피벗이 너무 작으면 수치적으로 불안정하다고 보고 null 반환.
+ */
 function solveLinearSystem(matrix: number[][], vector: number[]): number[] | null {
   const size = vector.length;
   const augmented = matrix.map((row, index) => [...row, vector[index]]);
 
-  // 부분 피벗팅을 포함한 Gauss-Jordan 소거로 선형계를 푼다.
   for (let pivotIndex = 0; pivotIndex < size; pivotIndex += 1) {
     let maxRow = pivotIndex;
     let maxValue = Math.abs(augmented[pivotIndex][pivotIndex]);
@@ -278,6 +348,17 @@ function solveLinearSystem(matrix: number[][], vector: number[]): number[] | nul
   return augmented.map((row) => row[size]);
 }
 
+/**
+ * 동시 제약 비선형 최적화(Gauss-Newton + damping, LM 스타일).
+ *
+ * 목적함수:
+ *   ||r(x)||^2 + λ||x - x0||^2
+ * - r(x): 대상 각도 잔차(각도-90)
+ * - 정규화항(λ): 과도한 좌표 이동 억제
+ *
+ * 성공 조건:
+ * - 모든 대상 잔차의 절댓값 최댓값 <= tolerance
+ */
 function solveRightAngleConstraints(
   baseRing: Coordinate[],
   targetIndices: number[],
@@ -300,8 +381,6 @@ function solveRightAngleConstraints(
     return computeConstraintResiduals(candidateRing, targetIndices);
   };
 
-  // Levenberg-Marquardt 방식 반복:
-  // 각도 오차를 줄이되 원래 형상에서의 변형도 함께 억제한다.
   for (let iteration = 0; iteration < MAX_SOLVER_ITERATIONS; iteration += 1) {
     const residual = residualFunction(variables);
     if (residual.some((value) => !Number.isFinite(value))) {
@@ -370,9 +449,11 @@ function solveRightAngleConstraints(
         }, 0);
 
     if (candidateObjective < currentObjective) {
+      // 개선된 스텝은 채택하고 damping을 줄여 더 공격적으로 탐색.
       variables = candidateVariables;
       damping = Math.max(1e-6, damping * 0.5);
     } else {
+      // 악화된 스텝은 거절하고 damping을 키워 안정성 우선.
       damping = Math.min(1e6, damping * 4);
     }
   }
@@ -385,12 +466,16 @@ function solveRightAngleConstraints(
   return computeMaxAbs(finalResidual) <= tolerance ? finalRing : null;
 }
 
+/**
+ * 정확해법 실패 시 사용하는 반복 보정 폴백.
+ * 대상 꼭지점을 순회하며 직각 근사 이동을 반복하고,
+ * tolerance 이내로 수렴하면 성공으로 간주한다.
+ */
 function fallbackIterativeAdjust(
   baseRing: Coordinate[],
   targetIndices: number[],
   tolerance: number
 ): Coordinate[] | null {
-  // 비선형 해석이 실패할 때 사용하는 보수적 폴백 루틴.
   const ring = baseRing.map((coord) => [coord[0], coord[1]] as Coordinate);
 
   for (let iteration = 0; iteration < MAX_FALLBACK_ITERATIONS; iteration += 1) {
@@ -444,6 +529,10 @@ function fallbackIterativeAdjust(
   return maxError <= tolerance ? ring : null;
 }
 
+/**
+ * 렌더링 시 각 꼭지점에 "내각 라벨 + 마커" 스타일을 동적으로 생성한다.
+ * 폴리곤 기본 스타일과 함께 배열로 반환되어 레이어에 합성된다.
+ */
 function buildVertexAngleStyles(polygon: Polygon): Style[] {
   const ring = getRingWithoutClosure(polygon);
   if (ring.length < 3) {
@@ -480,6 +569,16 @@ function buildVertexAngleStyles(polygon: Polygon): Style[] {
   return styles;
 }
 
+/**
+ * 벡터소스의 모든 폴리곤을 순회하여,
+ * 범위 조건을 만족하는 각도(내각 또는 외각)를 90도로 보정한다.
+ *
+ * 처리 순서:
+ * 1) 각 폴리곤에서 대상 인덱스 수집
+ * 2) 정확해법 시도
+ * 3) 실패 시 반복 보정 폴백
+ * 4) 성공한 링만 geometry에 반영
+ */
 export function adjustPolygonAnglesToRight(
   vectorSource: VectorSource<Feature<Polygon>>,
   minAngle: number,
@@ -510,7 +609,7 @@ export function adjustPolygonAnglesToRight(
       continue;
     }
 
-    // 먼저 동시 제약 해법을 시도하고, 실패하면 반복 보정으로 폴백한다.
+    // 먼저 동시 제약 해법을 시도하고, 실패하면 반복 보정으로 폴백.
     const solvedRing =
       solveRightAngleConstraints(ring, targetIndices, TARGET_TOLERANCE) ??
       fallbackIterativeAdjust(ring, targetIndices, TARGET_TOLERANCE);
@@ -531,6 +630,12 @@ export function adjustPolygonAnglesToRight(
   return { updatedPolygons, updatedVertices };
 }
 
+/**
+ * OpenLayers 맵과 드로잉 인터랙션을 초기화한다.
+ * - OSM 타일 레이어 + 벡터 레이어 구성
+ * - Polygon Draw 활성화
+ * - vectorSource를 외부로 반환해 "각도 조정 버튼"에서 재사용
+ */
 export function createPolygonMap(targetId: string): PolygonMapContext {
   const targetElement = document.getElementById(targetId);
   if (!targetElement) {
@@ -538,6 +643,7 @@ export function createPolygonMap(targetId: string): PolygonMapContext {
   }
 
   const vectorSource = new VectorSource<Feature<Polygon>>();
+  // 스타일 함수: 기본 폴리곤 스타일 + 꼭지점 각도 라벨 스타일을 합쳐 반환.
   const styleFunction: StyleFunction = (feature) => {
     const geometry = feature.getGeometry();
     if (!geometry || geometry.getType() !== "Polygon") {
@@ -572,11 +678,13 @@ export function createPolygonMap(targetId: string): PolygonMapContext {
     type: "Polygon"
   });
 
+  // 생성 시각은 디버깅/추적용 메타데이터로 남긴다.
   draw.on("drawstart", (event) => {
     const feature = event.feature as Feature<Polygon>;
     feature.set("createdAt", new Date().toISOString());
   });
 
+  // 드로잉 종료 시 현재 계산 가능한 라벨 수를 로그로 확인.
   draw.on("drawend", (event) => {
     const feature = event.feature as Feature<Polygon>;
     const polygon = feature.getGeometry();
