@@ -43,8 +43,8 @@ type AngleAdjustResult = {
 };
 
 function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
-  // OpenLayers polygon ring is closed (first point repeated at the end).
-  // Angle calculations are easier with a non-duplicated vertex list.
+  // OpenLayers 폴리곤 링은 마지막에 시작점이 한 번 더 들어간 폐합 구조다.
+  // 각도 계산은 중복 꼭지점이 없는 배열에서 처리하는 것이 안정적이다.
   const outerRing = polygon.getCoordinates()[0] ?? [];
   if (outerRing.length < 2) {
     return [...outerRing];
@@ -207,7 +207,7 @@ function numericJacobian(
   }
 
   const jacobian = baseResidual.map(() => new Array<number>(variables.length).fill(0));
-  // Numerical differentiation for each variable column.
+  // 각 변수 축마다 수치 미분으로 Jacobian 열을 계산한다.
   for (let column = 0; column < variables.length; column += 1) {
     const plus = [...variables];
     const minus = [...variables];
@@ -234,7 +234,7 @@ function solveLinearSystem(matrix: number[][], vector: number[]): number[] | nul
   const size = vector.length;
   const augmented = matrix.map((row, index) => [...row, vector[index]]);
 
-  // Gauss-Jordan elimination with partial pivoting.
+  // 부분 피벗팅을 포함한 Gauss-Jordan 소거로 선형계를 푼다.
   for (let pivotIndex = 0; pivotIndex < size; pivotIndex += 1) {
     let maxRow = pivotIndex;
     let maxValue = Math.abs(augmented[pivotIndex][pivotIndex]);
@@ -300,8 +300,8 @@ function solveRightAngleConstraints(
     return computeConstraintResiduals(candidateRing, targetIndices);
   };
 
-  // Levenberg-Marquardt style loop:
-  // minimize angle residuals while keeping deformation small.
+  // Levenberg-Marquardt 방식 반복:
+  // 각도 오차를 줄이되 원래 형상에서의 변형도 함께 억제한다.
   for (let iteration = 0; iteration < MAX_SOLVER_ITERATIONS; iteration += 1) {
     const residual = residualFunction(variables);
     if (residual.some((value) => !Number.isFinite(value))) {
@@ -390,7 +390,7 @@ function fallbackIterativeAdjust(
   targetIndices: number[],
   tolerance: number
 ): Coordinate[] | null {
-  // Conservative fallback when the nonlinear solver fails.
+  // 비선형 해석이 실패할 때 사용하는 보수적 폴백 루틴.
   const ring = baseRing.map((coord) => [coord[0], coord[1]] as Coordinate);
 
   for (let iteration = 0; iteration < MAX_FALLBACK_ITERATIONS; iteration += 1) {
@@ -510,7 +510,7 @@ export function adjustPolygonAnglesToRight(
       continue;
     }
 
-    // First try simultaneous constrained solve; fallback to iterative adjustment.
+    // 먼저 동시 제약 해법을 시도하고, 실패하면 반복 보정으로 폴백한다.
     const solvedRing =
       solveRightAngleConstraints(ring, targetIndices, TARGET_TOLERANCE) ??
       fallbackIterativeAdjust(ring, targetIndices, TARGET_TOLERANCE);
