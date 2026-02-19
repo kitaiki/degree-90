@@ -1,0 +1,161 @@
+import type Feature from "ol/Feature";
+import type Polygon from "ol/geom/Polygon";
+import type { Coordinate } from "ol/coordinate";
+
+/**
+ * (A, B, C)에서 B의 내각(0~180)을 degrees로 계산 (수치적으로 안정적인 atan2 사용)
+ */
+function interiorAngleDeg(A: Coordinate, B: Coordinate, C: Coordinate): number {
+  const ux = A[0] - B[0];
+  const uy = A[1] - B[1];
+  const vx = C[0] - B[0];
+  const vy = C[1] - B[1];
+
+  const dot = ux * vx + uy * vy;
+  const cross = ux * vy - uy * vx;
+  const rad = Math.atan2(Math.abs(cross), dot); // 0..PI
+  return (rad * 180) / Math.PI;
+}
+
+function dist(a: Coordinate, b: Coordinate): number {
+  const dx = a[0] - b[0];
+  const dy = a[1] - b[1];
+  return Math.hypot(dx, dy);
+}
+
+function sub(a: Coordinate, b: Coordinate): Coordinate {
+  return [a[0] - b[0], a[1] - b[1]];
+}
+
+function add(a: Coordinate, b: Coordinate): Coordinate {
+  return [a[0] + b[0], a[1] + b[1]];
+}
+
+function mul(v: Coordinate, s: number): Coordinate {
+  return [v[0] * s, v[1] * s];
+}
+
+function normalize(v: Coordinate): Coordinate | null {
+  const len = Math.hypot(v[0], v[1]);
+  if (len < 1e-12) return null;
+  return [v[0] / len, v[1] / len];
+}
+
+/**
+ * A, C를 고정하고 B만 "최소 이동"하여 ∠ABC = 90°가 되도록 보정.
+ * - ∠ABC=90°를 만족하는 B의 자취는 "AC를 지름으로 하는 원(탈레스의 원)".
+ * - 현재 B0에서 그 원으로의 최단 이동점은, 중심 M에서 B0 방향으로 원에 투영한 점.
+ *
+ * 반환: 보정된 B 좌표 (보정 불가하면 null)
+ */
+function snapBToRightAngleMinMove(
+  A: Coordinate,
+  B0: Coordinate,
+  C: Coordinate
+): Coordinate | null {
+  // 탈레스 원: center M = (A+C)/2, radius r = |A-C|/2
+  const M: Coordinate = [(A[0] + C[0]) / 2, (A[1] + C[1]) / 2];
+  const AC = dist(A, C);
+  if (AC < 1e-9) return null; // A와 C가 같으면 원이 성립 불가
+
+  const r = AC / 2;
+  const w = sub(B0, M);
+  const wn = normalize(w);
+
+  if (wn) {
+    return add(M, mul(wn, r));
+  }
+
+  // B0 == M 인 극단 케이스: AC에 수직인 방향으로 임의 선택
+  const dir = normalize(sub(C, A));
+  if (!dir) return null;
+  const perp: Coordinate = [-dir[1], dir[0]]; // AC에 수직
+  return add(M, mul(perp, r));
+}
+
+/**
+ * 폴리곤 feature 목록에서,
+ * 각 꼭지점 B의 내각이 [minAngleDeg, maxAngleDeg]에 들어오면
+ * "B만 최소 이동"하여 90도로 스냅하고,
+ * feature 좌표를 업데이트한다.
+ *
+ * 주의:
+ * - 계산은 입력 좌표계가 평면(미터) 좌표계일 때 가장 정확합니다. (예: EPSG:5179)
+ * - 링의 마지막 좌표(닫힘점)는 자동으로 첫점과 동일하게 유지합니다.
+ */
+export function updatePolygonsRightAngleByMovingBMin(
+  features: Array<Feature<Polygon>>,
+  minAngleDeg: number,
+  maxAngleDeg: number
+): {
+  featureCount: number;
+  updatedFeatureCount: number;
+  updatedVertexCount: number;
+} {
+  let updatedFeatureCount = 0;
+  let updatedVertexCount = 0;
+
+  for (const feature of features) {
+    const geom = feature.getGeometry();
+    if (!geom) continue;
+
+    const rings = geom.getCoordinates(); // Polygon: Coordinate[][]
+    if (!rings.length) continue;
+
+    let featureUpdated = false;
+
+    const newRings = rings.map((ring) => {
+      if (ring.length < 4) return ring; // 최소: [p0,p1,p2,p0]
+
+      // 닫힘점 제외한 유효 꼭지점 수
+      const n = ring.length - 1;
+
+      // 방어: 닫힘이 안 되어있으면 닫아줌 (실무에서 가끔 들어옴)
+      const isClosed =
+        ring[0][0] === ring[ring.length - 1][0] &&
+        ring[0][1] === ring[ring.length - 1][1];
+
+      const baseRing = isClosed ? ring.slice(0, n) : ring.slice(); // 닫힘점 제거(또는 그대로)
+      const m = baseRing.length;
+      if (m < 3) return ring;
+
+      const out = baseRing.map((coord) => ([coord[0], coord[1]] as Coordinate));
+
+      for (let i = 0; i < m; i++) {
+        const iPrev = (i - 1 + m) % m;
+        const iNext = (i + 1) % m;
+
+        const A = out[iPrev];
+        const B0 = out[i];
+        const C = out[iNext];
+
+        const ang = interiorAngleDeg(A, B0, C);
+        if (ang < minAngleDeg || ang > maxAngleDeg) continue;
+
+        const B1 = snapBToRightAngleMinMove(A, B0, C);
+        if (!B1) continue;
+
+        // 업데이트
+        out[i] = B1;
+        updatedVertexCount++;
+        featureUpdated = true;
+      }
+
+      // 링 닫기
+      out.push([out[0][0], out[0][1]]);
+      return out;
+    });
+
+    if (featureUpdated) {
+      geom.setCoordinates(newRings);
+      feature.changed();
+      updatedFeatureCount++;
+    }
+  }
+
+  return {
+    featureCount: features.length,
+    updatedFeatureCount,
+    updatedVertexCount,
+  };
+}
