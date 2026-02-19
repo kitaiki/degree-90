@@ -1,0 +1,396 @@
+import Draw from "ol/interaction/Draw";
+import Map from "ol/Map";
+import View from "ol/View";
+import OSM from "ol/source/OSM";
+import TileLayer from "ol/layer/Tile";
+import VectorLayer from "ol/layer/Vector";
+import VectorSource from "ol/source/Vector";
+import Point from "ol/geom/Point";
+import { Fill, Stroke, Style, Circle as CircleStyle, Text as TextStyle } from "ol/style";
+import type { Coordinate } from "ol/coordinate";
+import type Feature from "ol/Feature";
+import type Polygon from "ol/geom/Polygon";
+import type { StyleFunction } from "ol/style/Style";
+
+import proj4 from "proj4";
+import { register } from "ol/proj/proj4";
+import { transform as projTransform } from "ol/proj";
+
+/**
+ * ------------------------------------------------------------
+ * EPSG 설정/등록
+ * - 계산(각도/보정)은 EPSG:5179에서
+ * - 렌더링/geometry 저장은 EPSG:3857에서
+ * ------------------------------------------------------------
+ */
+const SRC_EPSG = "EPSG:3857";
+const CALC_EPSG = "EPSG:5179";
+
+// EPSG:5179 (KGD2002 / Unified CS) 정의 등록 (epsg.io PROJ.4 기반)
+proj4.defs(
+  CALC_EPSG,
+  "+proj=tmerc +lat_0=38 +lon_0=127.5 +k=0.9996 +x_0=1000000 +y_0=2000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +type=crs"
+);
+register(proj4);
+
+function to5179(coord3857: Coordinate): Coordinate {
+  return projTransform(coord3857, SRC_EPSG, CALC_EPSG) as Coordinate;
+}
+function to3857(coord5179: Coordinate): Coordinate {
+  return projTransform(coord5179, CALC_EPSG, SRC_EPSG) as Coordinate;
+}
+
+/**
+ * 폴리곤/라벨 기본 렌더 스타일 정의.
+ */
+const polygonFill = new Fill({ color: "rgba(0, 153, 255, 0.22)" });
+const polygonStroke = new Stroke({ color: "#005fa3", width: 2 });
+const vertexMarker = new CircleStyle({
+  radius: 5,
+  fill: new Fill({ color: "#005fa3" }),
+  stroke: new Stroke({ color: "#ffffff", width: 1.5 })
+});
+const angleTextFill = new Fill({ color: "#0b2a42" });
+const angleTextStroke = new Stroke({ color: "#ffffff", width: 3 });
+const polygonBaseStyle = new Style({
+  fill: polygonFill,
+  stroke: polygonStroke
+});
+
+/**
+ * 각도 보정 파라미터
+ */
+const TARGET_ANGLE = 90;
+const TARGET_TOLERANCE = 0.001;
+const MAX_FALLBACK_ITERATIONS = 160;
+
+export type PolygonMapContext = {
+  map: Map;
+  vectorSource: VectorSource<Feature<Polygon>>;
+};
+
+type AngleAdjustResult = {
+  updatedPolygons: number;
+  updatedVertices: number;
+};
+
+/**
+ * OpenLayers Polygon 외곽 링에서 중복 폐합점을 제거한다.
+ */
+function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
+  const outerRing = polygon.getCoordinates()[0] ?? [];
+  if (outerRing.length < 2) return [...outerRing];
+
+  const first = outerRing[0];
+  const last = outerRing[outerRing.length - 1];
+  const isClosed = first[0] === last[0] && first[1] === last[1];
+  return isClosed ? outerRing.slice(0, -1) : [...outerRing];
+}
+
+/** 현재 polygon 좌표(3857)를 읽어 5179 링(계산용)으로 변환 */
+function getRingWithoutClosure5179(polygon: Polygon): Coordinate[] {
+  return getRingWithoutClosure(polygon).map(to5179);
+}
+
+/**
+ * 내각(0~180) 계산
+ */
+function calculateInteriorAngle(prev: Coordinate, current: Coordinate, next: Coordinate): number | null {
+  const bax = prev[0] - current[0];
+  const bay = prev[1] - current[1];
+  const bcx = next[0] - current[0];
+  const bcy = next[1] - current[1];
+
+  const baLength = Math.hypot(bax, bay);
+  const bcLength = Math.hypot(bcx, bcy);
+  if (baLength === 0 || bcLength === 0) return null;
+
+  const cosine = (bax * bcx + bay * bcy) / (baLength * bcLength);
+  const clamped = Math.max(-1, Math.min(1, cosine));
+  const angle = (Math.acos(clamped) * 180) / Math.PI;
+  return Number.isFinite(angle) ? angle : null;
+}
+
+/** 링을 폐합 포함(OpenLayers 형식)으로 */
+function createClosedRing(ring: Coordinate[]): Coordinate[] {
+  if (ring.length === 0) return [];
+  return [...ring, [...ring[0]]];
+}
+
+/** 범위 비교 */
+function inRange(value: number, min: number, max: number): boolean {
+  return value >= min && value <= max;
+}
+
+/** 링 index의 내각 */
+function getAngleAtIndex(ring: Coordinate[], index: number): number | null {
+  const n = ring.length;
+  const prev = ring[(index - 1 + n) % n];
+  const cur = ring[index];
+  const next = ring[(index + 1) % n];
+  return calculateInteriorAngle(prev, cur, next);
+}
+
+/**
+ * 범위 매칭 대상 꼭지점 인덱스 수집
+ */
+function collectTargetVertexIndices(ring: Coordinate[], min: number, max: number): number[] {
+  const indices: number[] = [];
+  for (let i = 0; i < ring.length; i += 1) {
+    const interior = getAngleAtIndex(ring, i);
+    if (interior === null) continue;
+    const exterior = 360 - interior;
+    if (inRange(interior, min, max) || inRange(exterior, min, max)) {
+      indices.push(i);
+    }
+  }
+  return indices;
+}
+
+/**
+ * 기존 방식(Thales 원 투영) - 90도 맞추기
+ */
+function moveVertexToRightAngle(prev: Coordinate, current: Coordinate, next: Coordinate): Coordinate | null {
+  const midX = (prev[0] + next[0]) / 2;
+  const midY = (prev[1] + next[1]) / 2;
+  const radius = Math.hypot(next[0] - prev[0], next[1] - prev[1]) / 2;
+  if (radius === 0) return null;
+
+  const toCurX = current[0] - midX;
+  const toCurY = current[1] - midY;
+  const toCurLen = Math.hypot(toCurX, toCurY);
+
+  if (toCurLen > 0) {
+    const s = radius / toCurLen;
+    return [midX + toCurX * s, midY + toCurY * s];
+  }
+
+  const edgeX = next[0] - prev[0];
+  const edgeY = next[1] - prev[1];
+  const edgeLen = Math.hypot(edgeX, edgeY);
+  if (edgeLen === 0) return null;
+
+  const unitPerp: Coordinate = [-edgeY / edgeLen, edgeX / edgeLen];
+  const candA: Coordinate = [midX + unitPerp[0] * radius, midY + unitPerp[1] * radius];
+  const candB: Coordinate = [midX - unitPerp[0] * radius, midY - unitPerp[1] * radius];
+
+  const da = Math.hypot(candA[0] - current[0], candA[1] - current[1]);
+  const db = Math.hypot(candB[0] - current[0], candB[1] - current[1]);
+  return da <= db ? candA : candB;
+}
+
+/* ============================================================
+ * ✅ 정책 2: “가능하면 이전 방향 유지 + 안 되면 90도 우선(폴백)”
+ * ============================================================ */
+
+/** unit 방향 벡터 */
+function unitDirection(from: Coordinate, to: Coordinate): Coordinate | null {
+  const dx = to[0] - from[0];
+  const dy = to[1] - from[1];
+  const len = Math.hypot(dx, dy);
+  if (len === 0) return null;
+  return [dx / len, dy / len];
+}
+
+/**
+ * 원본(baseRing)의 incoming edge 방향을 각 꼭지점마다 고정
+ * incomingDir[i] = unit(baseRing[i] - baseRing[i-1])
+ */
+function buildIncomingDirections(baseRing: Coordinate[]): Array<Coordinate | null> {
+  const n = baseRing.length;
+  const dirs: Array<Coordinate | null> = new Array(n).fill(null);
+  for (let i = 0; i < n; i += 1) {
+    const prevIdx = (i - 1 + n) % n;
+    dirs[i] = unitDirection(baseRing[prevIdx], baseRing[i]);
+  }
+  return dirs;
+}
+
+/**
+ * 이전 방향 유지(원본 incomingDir) 제약 하에서 90도 만들기
+ * moved = prev + t*d
+ * t = dot(d, (next - prev))
+ *
+ * - t <= 0 이면 “이전 방향을 유지하면서”는 해가 의미 없어서 null
+ */
+function moveVertexToRightAngleKeepingIncomingDirection(
+  prev: Coordinate,
+  next: Coordinate,
+  incomingDir: Coordinate
+): Coordinate | null {
+  const dx = incomingDir[0];
+  const dy = incomingDir[1];
+
+  const vx = next[0] - prev[0];
+  const vy = next[1] - prev[1];
+
+  const t = dx * vx + dy * vy;
+  if (!Number.isFinite(t) || t <= 1e-9) return null;
+
+  const moved: Coordinate = [prev[0] + t * dx, prev[1] + t * dy];
+  if (!Number.isFinite(moved[0]) || !Number.isFinite(moved[1])) return null;
+  return moved;
+}
+
+/**
+ * ✅ 정책2 반복 보정:
+ * 1) 방향 유지 해가 있으면 그걸로 이동
+ * 2) 없으면 기존 원 투영(moveVertexToRightAngle)로라도 90도 맞추기
+ */
+function fallbackIterativeAdjustPreferDirection(
+  baseRing: Coordinate[],
+  targetIndices: number[],
+  tolerance: number
+): Coordinate[] | null {
+  const ring = baseRing.map((c) => [c[0], c[1]] as Coordinate);
+  const incomingDirs = buildIncomingDirections(baseRing);
+
+  for (let iteration = 0; iteration < MAX_FALLBACK_ITERATIONS; iteration += 1) {
+    let changed = false;
+    let maxError = 0;
+
+    for (const index of targetIndices) {
+      const n = ring.length;
+      const prevIdx = (index - 1 + n) % n;
+      const nextIdx = (index + 1) % n;
+
+      const prev = ring[prevIdx];
+      const current = ring[index];
+      const next = ring[nextIdx];
+
+      const angle = calculateInteriorAngle(prev, current, next);
+      if (angle === null) continue;
+
+      const error = Math.abs(angle - TARGET_ANGLE);
+      maxError = Math.max(maxError, error);
+      if (error <= tolerance) continue;
+
+      const dir = incomingDirs[index];
+
+      // 1) 방향 유지 우선
+      let moved: Coordinate | null = null;
+      if (dir) {
+        moved = moveVertexToRightAngleKeepingIncomingDirection(prev, next, dir);
+      }
+
+      // 2) 방향 유지가 불가능하면 90도 우선(기존 방식)
+      if (!moved) {
+        moved = moveVertexToRightAngle(prev, current, next);
+      }
+
+      if (!moved) continue;
+
+      ring[index] = moved;
+      changed = true;
+    }
+
+    if (maxError <= tolerance) return ring;
+    if (!changed) break;
+  }
+
+  // 최종 검증
+  let finalMaxError = 0;
+  for (const index of targetIndices) {
+    const a = getAngleAtIndex(ring, index);
+    if (a === null) return null;
+    finalMaxError = Math.max(finalMaxError, Math.abs(a - TARGET_ANGLE));
+  }
+  return finalMaxError <= tolerance ? ring : null;
+}
+
+/**
+ * 렌더링: 각 꼭지점에 내각 라벨 + 마커
+ * - 각도 계산은 5179에서
+ * - 매번 polygon 좌표를 다시 읽어서(fresh) 계산
+ */
+function buildVertexAngleStyles(polygon: Polygon): Style[] {
+  const baseRing3857 = getRingWithoutClosure(polygon);
+  if (baseRing3857.length < 3) return [];
+
+  const styles: Style[] = [];
+  for (let index = 0; index < baseRing3857.length; index += 1) {
+    const freshRing3857 = getRingWithoutClosure(polygon);
+    if (freshRing3857.length < 3) return styles;
+
+    const n = freshRing3857.length;
+    const prev3857 = freshRing3857[(index - 1 + n) % n];
+    const cur3857 = freshRing3857[index];
+    const next3857 = freshRing3857[(index + 1) % n];
+
+    const angle = calculateInteriorAngle(to5179(prev3857), to5179(cur3857), to5179(next3857));
+    if (angle === null) continue;
+
+    styles.push(
+      new Style({
+        geometry: new Point(cur3857), // 렌더링은 3857
+        image: vertexMarker,
+        text: new TextStyle({
+          text: `${angle.toFixed(1)}°`,
+          offsetY: -12,
+          textAlign: "center",
+          textBaseline: "bottom",
+          font: "12px sans-serif",
+          fill: angleTextFill,
+          stroke: angleTextStroke
+        })
+      })
+    );
+  }
+  return styles;
+}
+
+/**
+ * ✅ 최종 보정 함수
+ * - 각도/보정은 5179에서
+ * - geometry 반영은 3857로 되돌려 적용
+ * - 보정 로직은 “정책2(방향 우선, 불가 시 90도 우선)” 반복 보정 사용
+ */
+export function adjustPolygonAnglesToRight(
+  vectorSource: VectorSource<Feature<Polygon>>,
+  minAngle: number,
+  maxAngle: number
+): AngleAdjustResult {
+  const normalizedMin = Math.max(0, Math.min(360, minAngle));
+  const normalizedMax = Math.max(0, Math.min(360, maxAngle));
+  const rangeMin = Math.min(normalizedMin, normalizedMax);
+  const rangeMax = Math.max(normalizedMin, normalizedMax);
+
+  let updatedPolygons = 0;
+  let updatedVertices = 0;
+
+  for (const feature of vectorSource.getFeatures()) {
+    const geometry = feature.getGeometry();
+    if (!geometry || geometry.getType() !== "Polygon") continue;
+
+    const polygon = geometry as Polygon;
+
+    // ✅ 현재 좌표를 매번 읽어서 계산용(5179) 링 생성
+    const ring5179 = getRingWithoutClosure5179(polygon);
+    if (ring5179.length < 3) continue;
+
+    const targetIndices = collectTargetVertexIndices(ring5179, rangeMin, rangeMax);
+    if (targetIndices.length === 0) continue;
+
+    // ✅ 정책2 보정(방향 우선, 불가 시 90도 우선)
+    const solvedRing5179 = fallbackIterativeAdjustPreferDirection(
+      ring5179,
+      targetIndices,
+      TARGET_TOLERANCE
+    );
+
+    if (!solvedRing5179) continue;
+
+    // ✅ geometry 반영은 3857로 되돌림
+    const solvedRing3857 = solvedRing5179.map(to3857);
+    polygon.setCoordinates([createClosedRing(solvedRing3857)]);
+
+    updatedPolygons += 1;
+    updatedVertices += targetIndices.length;
+  }
+
+  if (updatedPolygons > 0) {
+    vectorSource.changed();
+  }
+
+  return { updatedPolygons, updatedVertices };
+}
