@@ -1,0 +1,225 @@
+import type Feature from "ol/Feature";
+import type Polygon from "ol/geom/Polygon";
+import type { Coordinate } from "ol/coordinate";
+
+import proj4 from "proj4";
+import { register } from "ol/proj/proj4";
+import { get as getProjection, transform as olTransform } from "ol/proj";
+
+/** EPSG:5179 등록 (1회) */
+let _epsg5179Ready = false;
+export function ensureEPSG5179(): void {
+  if (_epsg5179Ready) return;
+
+  proj4.defs(
+    "EPSG:5179",
+    "+proj=tmerc +lat_0=38 +lon_0=127.5 +k=0.9996 +x_0=1000000 +y_0=2000000 +ellps=GRS80 +units=m +no_defs"
+  );
+  register(proj4);
+  getProjection("EPSG:5179");
+  _epsg5179Ready = true;
+}
+
+/** 안정적인 내각 계산(0~180) */
+function interiorAngleDeg(A: Coordinate, B: Coordinate, C: Coordinate): number {
+  const ux = A[0] - B[0];
+  const uy = A[1] - B[1];
+  const vx = C[0] - B[0];
+  const vy = C[1] - B[1];
+
+  const dot = ux * vx + uy * vy;
+  const cross = ux * vy - uy * vx;
+  const rad = Math.atan2(Math.abs(cross), dot);
+  return (rad * 180) / Math.PI;
+}
+
+function dist(a: Coordinate, b: Coordinate): number {
+  return Math.hypot(a[0] - b[0], a[1] - b[1]);
+}
+function sub(a: Coordinate, b: Coordinate): Coordinate {
+  return [a[0] - b[0], a[1] - b[1]];
+}
+function add(a: Coordinate, b: Coordinate): Coordinate {
+  return [a[0] + b[0], a[1] + b[1]];
+}
+function mul(v: Coordinate, s: number): Coordinate {
+  return [v[0] * s, v[1] * s];
+}
+function normalize(v: Coordinate): Coordinate | null {
+  const len = Math.hypot(v[0], v[1]);
+  if (len < 1e-12) return null;
+  return [v[0] / len, v[1] / len];
+}
+function clamp(n: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, n));
+}
+
+/**
+ * A, C 고정 + B만 이동해서 ∠ABC=90° 조건을 만족하는 점들(탈레스 원) 중
+ * 현재 B0에서 "최소 이동"점.
+ */
+function snapBToRightAngleMinMove(A: Coordinate, B0: Coordinate, C: Coordinate): Coordinate | null {
+  const AC = dist(A, C);
+  if (AC < 1e-9) return null;
+
+  const M: Coordinate = [(A[0] + C[0]) / 2, (A[1] + C[1]) / 2];
+  const r = AC / 2;
+
+  const w = sub(B0, M);
+  const wn = normalize(w);
+  if (wn) return add(M, mul(wn, r));
+
+  // B0 == M 극단: AC에 수직인 방향으로 선택
+  const dir = normalize(sub(C, A));
+  if (!dir) return null;
+  const perp: Coordinate = [-dir[1], dir[0]];
+  return add(M, mul(perp, r));
+}
+
+export interface RightAngleRelaxOptions {
+  /** 최대 반복 횟수(수렴용). 보통 5~15 */
+  maxIterations?: number;
+  /** 감쇠(0~1). 1은 빠르지만 흔들릴 수 있음. 보통 0.4~0.8 */
+  damping?: number;
+  /** 한 iteration에서 꼭지점 1개가 이동할 수 있는 최대 거리(m) */
+  maxMoveMeters?: number;
+  /** iteration 종료 기준: 최대 이동량이 이 값보다 작으면 종료(m) */
+  stopEpsilonMeters?: number;
+  /** 90도 목표 허용 오차(표시/검증용). 로직에는 직접 영향은 없음 */
+  targetToleranceDeg?: number;
+}
+
+/**
+ * 다각형에서 [minAngleDeg, maxAngleDeg] 범위에 들어오는 꼭지점을 "모두" 90도로 수렴시키는 함수.
+ * - EPSG:3857 -> EPSG:5179 변환 후 계산/보정 -> 3857로 복귀 후 geometry 업데이트
+ * - 동시 업데이트(Jacobi) + 반복 수렴 + 감쇠로 “이전 꼭지점이 다시 깨지는 현상”을 줄임
+ *
+ * 현실적인 주의:
+ * - 모든 대상 꼭지점을 정확히 90°로 "동시에" 만족시키는 해가 항상 존재하진 않습니다(폐곡선/인접 제약).
+ * - 그 경우 이 알고리즘은 가능한 한 90°로 “가깝게” 수렴합니다.
+ */
+export function relaxPolygonsToRightAngles_BOnly_MinMove_With5179(
+  features: Array<Feature<Polygon>>,
+  minAngleDeg: number,
+  maxAngleDeg: number,
+  opts: RightAngleRelaxOptions = {}
+): {
+  featureCount: number;
+  updatedFeatureCount: number;
+  updatedVertexCountApprox: number;
+  iterationsUsedMax: number;
+} {
+  ensureEPSG5179();
+
+  const SRC = "EPSG:3857";
+  const DST = "EPSG:5179";
+
+  const maxIterations = opts.maxIterations ?? 10;
+  const damping = clamp(opts.damping ?? 0.6, 0, 1);
+  const maxMoveMeters = opts.maxMoveMeters ?? 5; // 필요하면 더 작게(예: 0.5m)
+  const stopEps = opts.stopEpsilonMeters ?? 0.001; // 1mm
+
+  let updatedFeatureCount = 0;
+  let updatedVertexCountApprox = 0;
+  let iterationsUsedMax = 0;
+
+  for (const feature of features) {
+    const geom = feature.getGeometry();
+    if (!geom) continue;
+
+    const rings3857 = geom.getCoordinates();
+    if (!rings3857.length) continue;
+
+    // 1) 3857 -> 5179 변환
+    let rings5179 = rings3857.map((ring) => ring.map((c) => olTransform(c, SRC, DST) as Coordinate));
+
+    let featureUpdated = false;
+    let featureIterUsed = 0;
+
+    // 2) 각 ring을 반복 수렴
+    rings5179 = rings5179.map((ring) => {
+      if (ring.length < 4) return ring;
+
+      const isClosed =
+        ring[0][0] === ring[ring.length - 1][0] &&
+        ring[0][1] === ring[ring.length - 1][1];
+
+      const base = isClosed ? ring.slice(0, ring.length - 1) : ring.slice();
+      const m = base.length;
+      if (m < 3) return ring;
+
+      let curr = base.map((p) => [p[0], p[1]] as Coordinate);
+
+      for (let it = 0; it < maxIterations; it++) {
+        let maxAppliedMove = 0;
+        let movedThisIter = 0;
+
+        // 동시 업데이트용(next)
+        const next = curr.map((p) => [p[0], p[1]] as Coordinate);
+
+        for (let i = 0; i < m; i++) {
+          const ip = (i - 1 + m) % m;
+          const inx = (i + 1) % m;
+
+          const A = curr[ip];
+          const B0 = curr[i];
+          const C = curr[inx];
+
+          const ang = interiorAngleDeg(A, B0, C);
+          if (ang < minAngleDeg || ang > maxAngleDeg) continue;
+
+          const BStar = snapBToRightAngleMinMove(A, B0, C);
+          if (!BStar) continue;
+
+          // 이동 벡터
+          const d = sub(BStar, B0);
+          const dLen = Math.hypot(d[0], d[1]);
+          if (dLen < 1e-12) continue;
+
+          // maxMove 제한 + damping 적용
+          const limited = Math.min(dLen, maxMoveMeters);
+          const stepLen = limited * damping;
+          const dir = [d[0] / dLen, d[1] / dLen] as Coordinate;
+
+          const B1 = add(B0, mul(dir, stepLen));
+          next[i] = B1;
+
+          movedThisIter++;
+          maxAppliedMove = Math.max(maxAppliedMove, stepLen);
+        }
+
+        // 수렴/종료 판단
+        curr = next;
+        featureIterUsed = Math.max(featureIterUsed, it + 1);
+
+        if (movedThisIter > 0) {
+          featureUpdated = true;
+          updatedVertexCountApprox += movedThisIter;
+        }
+
+        if (maxAppliedMove < stopEps) break;
+      }
+
+      // 닫기
+      curr.push([curr[0][0], curr[0][1]]);
+      return curr;
+    });
+
+    if (!featureUpdated) continue;
+
+    // 3) 5179 -> 3857 복귀 후 업데이트
+    const newRings3857 = rings5179.map((ring) => ring.map((c) => olTransform(c, DST, SRC) as Coordinate));
+    geom.setCoordinates(newRings3857);
+    feature.changed();
+
+    updatedFeatureCount++;
+    iterationsUsedMax = Math.max(iterationsUsedMax, featureIterUsed);
+  }
+
+  return {
+    featureCount: features.length,
+    updatedFeatureCount,
+    updatedVertexCountApprox,
+    iterationsUsedMax,
+  };
+}
