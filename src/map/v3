@@ -1,0 +1,336 @@
+import Point from "ol/geom/Point";
+import { Fill, Stroke, Style, Circle as CircleStyle, Text as TextStyle } from "ol/style";
+import type { Coordinate } from "ol/coordinate";
+import type Feature from "ol/Feature";
+import type Polygon from "ol/geom/Polygon";
+import type VectorSource from "ol/source/Vector";
+
+/**
+ * =========================
+ *  Rendering styles (same)
+ * =========================
+ */
+const polygonFill = new Fill({ color: "rgba(0, 153, 255, 0.22)" });
+const polygonStroke = new Stroke({ color: "#005fa3", width: 2 });
+const vertexMarker = new CircleStyle({
+  radius: 5,
+  fill: new Fill({ color: "#005fa3" }),
+  stroke: new Stroke({ color: "#ffffff", width: 1.5 })
+});
+const angleTextFill = new Fill({ color: "#0b2a42" });
+const angleTextStroke = new Stroke({ color: "#ffffff", width: 3 });
+export const polygonBaseStyle = new Style({
+  fill: polygonFill,
+  stroke: polygonStroke
+});
+
+export type AngleAdjustResult = {
+  updatedPolygons: number;
+  updatedVertices: number;
+};
+
+/**
+ * =========================
+ *  Params (sequential)
+ * =========================
+ * - 이미지 요구대로 "순차 보정"
+ * - (i, i+1) 두 꼭지점이 범위에 들어오면
+ *   (i-1 -> i) 와 (i+1 -> i+2) 가 직각이 되도록
+ *   i, i+1 점을 이동 (i-1, i+2는 고정)
+ */
+const TARGET_ANGLE_DEG = 90;
+const ANGLE_TOL_DEG = 0.001;      // “90도로 변경” 허용 오차(도)
+const MAX_PASSES = 30;            // 전체 링을 몇 번 돌며 수렴 시도할지
+const MAX_MOVE_RATIO = 0.35;      // 한 번 이동에서 너무 크게 튀는 것 방지(0~1), 0.35 권장
+
+/**
+ * OpenLayers Polygon 외곽 링에서 중복 폐합점을 제거한다.
+ */
+function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
+  const outerRing = polygon.getCoordinates()[0] ?? [];
+  if (outerRing.length < 2) return [...outerRing];
+  const first = outerRing[0];
+  const last = outerRing[outerRing.length - 1];
+  const isClosed = first[0] === last[0] && first[1] === last[1];
+  return isClosed ? outerRing.slice(0, -1) : [...outerRing];
+}
+
+/**
+ * 링을 OpenLayers 좌표 형식(폐합 포함)으로 되돌린다.
+ */
+function createClosedRing(ring: Coordinate[]): Coordinate[] {
+  if (ring.length === 0) return [];
+  return [...ring, [...ring[0]]];
+}
+
+/** 범위 비교 유틸(경계 포함). */
+function inRange(value: number, min: number, max: number): boolean {
+  return value >= min && value <= max;
+}
+
+/**
+ * (라벨/판단용) 세 점(prev-current-next)에서 current의 내각(0~180)을 계산한다.
+ */
+function calculateInteriorAngle(prev: Coordinate, current: Coordinate, next: Coordinate): number | null {
+  const bax = prev[0] - current[0];
+  const bay = prev[1] - current[1];
+  const bcx = next[0] - current[0];
+  const bcy = next[1] - current[1];
+
+  const baLength = Math.hypot(bax, bay);
+  const bcLength = Math.hypot(bcx, bcy);
+  if (baLength === 0 || bcLength === 0) return null;
+
+  const cosine = (bax * bcx + bay * bcy) / (baLength * bcLength);
+  const clamped = Math.max(-1, Math.min(1, cosine));
+  const angle = (Math.acos(clamped) * 180) / Math.PI;
+  return Number.isFinite(angle) ? angle : null;
+}
+
+/**
+ * 인덱스의 내각을 계산한다.
+ */
+function getAngleAtIndex(ring: Coordinate[], index: number): number | null {
+  const n = ring.length;
+  const prev = ring[(index - 1 + n) % n];
+  const cur = ring[index];
+  const next = ring[(index + 1) % n];
+  return calculateInteriorAngle(prev, cur, next);
+}
+
+/**
+ * “내각 또는 외각”이 range에 들어오는지 판정
+ */
+function isAngleInRange(interiorAngle: number | null, min: number, max: number): boolean {
+  if (interiorAngle === null || !Number.isFinite(interiorAngle)) return false;
+  const exterior = 360 - interiorAngle;
+  return inRange(interiorAngle, min, max) || inRange(exterior, min, max);
+}
+
+/**
+ * 벡터 유틸
+ */
+function dot(ax: number, ay: number, bx: number, by: number): number {
+  return ax * bx + ay * by;
+}
+function cross(ax: number, ay: number, bx: number, by: number): number {
+  return ax * by - ay * bx;
+}
+function rotateVec(x: number, y: number, rad: number): [number, number] {
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  return [x * c - y * s, x * s + y * c];
+}
+function radToDeg(rad: number): number {
+  return (rad * 180) / Math.PI;
+}
+function degToRad(deg: number): number {
+  return (deg * Math.PI) / 180;
+}
+
+/**
+ * =========================
+ *  핵심: (i, i+1) pair 보정
+ * =========================
+ * 고정점:
+ *  A = ring[i-1]
+ *  B = ring[i+2]
+ * 이동점:
+ *  P = ring[i]
+ *  Q = ring[i+1]
+ *
+ * 목표:
+ *  벡터 u = P - A   (A->P = 이전 변)
+ *  벡터 w = Q - B   (B->Q = 다음 변의 반대방향이지만, 직각 조건에 문제 없음)
+ *  u ⟂ (B - Q)  <=>  u ⟂ -(Q - B) <=>  u ⟂ w
+ *
+ * 그래서 u 와 w 를 서로 직각이 되도록,
+ * 현재 각도(signedAngle)를 target(±90°)로 맞추는 회전을
+ * u와 w에 절반씩 나눠 적용해서 P,Q를 이동한다.
+ *
+ * (이미지 예시)
+ *  i=10(=11번점), i+1=0(=1번점)인 pair에서
+ *  A=10번점, B=2번점 고정, 11/1 이동 → 10-11 과 1-2가 직각
+ */
+function adjustPairToRightAngle(
+  ring: Coordinate[],
+  i: number,
+  rangeMin: number,
+  rangeMax: number
+): { moved: boolean; movedVertices: number } {
+  const n = ring.length;
+  if (n < 4) return { moved: false, movedVertices: 0 };
+
+  const pIdx = i;
+  const qIdx = (i + 1) % n;
+  const aIdx = (i - 1 + n) % n;
+  const bIdx = (i + 2) % n;
+
+  // “마지막 꼭지점 제외” 요구는 보통 폐합 중복점 기준인데,
+  // 우리는 closure 제거 ring을 쓰기 때문에 여기서는 별도 제외 불필요.
+  // (다만 UI에서 마지막을 따로 표시한다면 호출부에서 인덱스 제한 가능)
+
+  const angleP = getAngleAtIndex(ring, pIdx);
+  const angleQ = getAngleAtIndex(ring, qIdx);
+
+  // 이미지 요구: "1,11번 꼭지점 각도가 범위면" => 두 꼭지점 모두 범위여야 처리
+  if (!isAngleInRange(angleP, rangeMin, rangeMax) || !isAngleInRange(angleQ, rangeMin, rangeMax)) {
+    return { moved: false, movedVertices: 0 };
+  }
+
+  const A = ring[aIdx];
+  const P = ring[pIdx];
+  const Q = ring[qIdx];
+  const B = ring[bIdx];
+
+  const ux = P[0] - A[0];
+  const uy = P[1] - A[1];
+  const wx = Q[0] - B[0];
+  const wy = Q[1] - B[1];
+
+  const lu = Math.hypot(ux, uy);
+  const lw = Math.hypot(wx, wy);
+  if (lu === 0 || lw === 0) return { moved: false, movedVertices: 0 };
+
+  // 현재 u->w의 signed angle
+  const signed = Math.atan2(cross(ux, uy, wx, wy), dot(ux, uy, wx, wy));
+  const signedDeg = radToDeg(signed);
+
+  // 목표는 "현재 회전 방향을 유지"한 ±90
+  const targetRad = signed >= 0 ? Math.PI / 2 : -Math.PI / 2;
+  const delta = signed - targetRad; // 0이면 이미 직각
+
+  if (Math.abs(radToDeg(delta)) <= ANGLE_TOL_DEG) {
+    return { moved: false, movedVertices: 0 };
+  }
+
+  // u는 -delta/2, w는 +delta/2 회전 (절반씩 분배)
+  const half = delta / 2;
+
+  const [rux, ruy] = rotateVec(ux, uy, -half);
+  const [rwx, rwy] = rotateVec(wx, wy, +half);
+
+  const newP: Coordinate = [A[0] + rux, A[1] + ruy];
+  const newQ: Coordinate = [B[0] + rwx, B[1] + rwy];
+
+  // 과도 이동 방지(원형상 보존): 한 번에 너무 멀리 이동하면 비율로 클램프
+  const dP = Math.hypot(newP[0] - P[0], newP[1] - P[1]);
+  const dQ = Math.hypot(newQ[0] - Q[0], newQ[1] - Q[1]);
+
+  const maxP = lu * MAX_MOVE_RATIO;
+  const maxQ = lw * MAX_MOVE_RATIO;
+
+  const finalP: Coordinate =
+    dP > maxP && dP > 0
+      ? [P[0] + ((newP[0] - P[0]) * maxP) / dP, P[1] + ((newP[1] - P[1]) * maxP) / dP]
+      : newP;
+
+  const finalQ: Coordinate =
+    dQ > maxQ && dQ > 0
+      ? [Q[0] + ((newQ[0] - Q[0]) * maxQ) / dQ, Q[1] + ((newQ[1] - Q[1]) * maxQ) / dQ]
+      : newQ;
+
+  ring[pIdx] = finalP;
+  ring[qIdx] = finalQ;
+
+  return { moved: true, movedVertices: 2 };
+}
+
+/**
+ * =========================
+ *  Main API (image-based)
+ * =========================
+ * - 포인트는 1..N 순서로 그려짐(= ring 인덱스 순서)
+ * - (i, i+1) 꼭지점이 범위이면
+ *   (i-1 -> i) 와 (i+1 -> i+2)가 직각이 되도록 i,i+1 이동
+ * - 폴리곤 업데이트 후 다음 꼭지점 각도 계산: "순차"로 적용되게 pass 반복
+ */
+export function adjustPolygonAnglesToRight(
+  vectorSource: VectorSource<Feature<Polygon>>,
+  minAngle: number,
+  maxAngle: number
+): AngleAdjustResult {
+  const normalizedMin = Math.max(0, Math.min(360, minAngle));
+  const normalizedMax = Math.max(0, Math.min(360, maxAngle));
+  const rangeMin = Math.min(normalizedMin, normalizedMax);
+  const rangeMax = Math.max(normalizedMin, normalizedMax);
+
+  let updatedPolygons = 0;
+  let updatedVertices = 0;
+
+  for (const feature of vectorSource.getFeatures()) {
+    const geometry = feature.getGeometry();
+    if (!geometry || geometry.getType() !== "Polygon") continue;
+
+    const polygon = geometry as Polygon;
+    const baseRing = getRingWithoutClosure(polygon);
+    if (baseRing.length < 4) continue;
+
+    const ring = baseRing.map((c) => [c[0], c[1]] as Coordinate);
+
+    let anyChange = false;
+
+    // 여러 pass로 수렴
+    for (let pass = 0; pass < MAX_PASSES; pass += 1) {
+      let changedThisPass = false;
+
+      // 이미지 요구: 1,2,3.. 순으로 진행(= i 증가)
+      // (마지막 꼭지점 제외)는 closure 중복점 의미인데,
+      // 우리는 closure 제거 ring이라 i=0..n-1 모두 의미가 있음.
+      for (let i = 0; i < ring.length; i += 1) {
+        const { moved, movedVertices } = adjustPairToRightAngle(ring, i, rangeMin, rangeMax);
+        if (moved) {
+          changedThisPass = true;
+          anyChange = true;
+          updatedVertices += movedVertices;
+          // “업데이트 후 다음 꼭지점 각도 계산” 요구대로,
+          // 바로 다음 i+1로 계속 진행(현재 ring이 갱신된 상태)
+        }
+      }
+
+      if (!changedThisPass) break;
+    }
+
+    if (!anyChange) continue;
+
+    polygon.setCoordinates([createClosedRing(ring)]);
+    updatedPolygons += 1;
+  }
+
+  if (updatedPolygons > 0) vectorSource.changed();
+  return { updatedPolygons, updatedVertices };
+}
+
+/**
+ * (선택) 각 꼭지점에 각도 라벨 + 마커 스타일
+ */
+export function buildVertexAngleStyles(polygon: Polygon): Style[] {
+  const ring = getRingWithoutClosure(polygon);
+  if (ring.length < 3) return [];
+
+  const styles: Style[] = [];
+  for (let index = 0; index < ring.length; index += 1) {
+    const prev = ring[(index - 1 + ring.length) % ring.length];
+    const cur = ring[index];
+    const next = ring[(index + 1) % ring.length];
+    const angle = calculateInteriorAngle(prev, cur, next);
+    if (angle === null) continue;
+
+    styles.push(
+      new Style({
+        geometry: new Point(cur),
+        image: vertexMarker,
+        text: new TextStyle({
+          text: `${angle.toFixed(1)}°`,
+          offsetY: -12,
+          textAlign: "center",
+          textBaseline: "bottom",
+          font: "12px sans-serif",
+          fill: angleTextFill,
+          stroke: angleTextStroke
+        })
+      })
+    );
+  }
+  return styles;
+}
