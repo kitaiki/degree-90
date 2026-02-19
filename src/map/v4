@@ -1,0 +1,412 @@
+import Point from "ol/geom/Point";
+import { Fill, Stroke, Style, Circle as CircleStyle, Text as TextStyle } from "ol/style";
+import type { Coordinate } from "ol/coordinate";
+import type Feature from "ol/Feature";
+import type Polygon from "ol/geom/Polygon";
+import type VectorSource from "ol/source/Vector";
+
+/**
+ * =========================
+ *  Rendering styles (same)
+ * =========================
+ */
+const polygonFill = new Fill({ color: "rgba(0, 153, 255, 0.22)" });
+const polygonStroke = new Stroke({ color: "#005fa3", width: 2 });
+const vertexMarker = new CircleStyle({
+  radius: 5,
+  fill: new Fill({ color: "#005fa3" }),
+  stroke: new Stroke({ color: "#ffffff", width: 1.5 })
+});
+const angleTextFill = new Fill({ color: "#0b2a42" });
+const angleTextStroke = new Stroke({ color: "#ffffff", width: 3 });
+
+export const polygonBaseStyle = new Style({
+  fill: polygonFill,
+  stroke: polygonStroke
+});
+
+export type AngleAdjustResult = {
+  updatedPolygons: number;
+  updatedVertices: number;
+};
+
+/**
+ * =========================
+ *  Params (tuning)
+ * =========================
+ * - ANGLE_TOL_DEG: “이미 충분히 직각” 판정 허용치
+ * - DOT_TOL: dot 기반 직각 허용치(스케일에 민감해서 정규화 dot 사용)
+ * - MAX_PASSES: 전체를 몇 번 돌며 수렴
+ * - MAX_MOVE_RATIO: 한 번 이동에서 과도 이동 제한(형상 보존 핵심)
+ */
+const ANGLE_TOL_DEG = 0.01;
+const DOT_TOL = 1e-6;     // normalized dot (cos) 허용치
+const MAX_PASSES = 40;
+const MAX_MOVE_RATIO = 0.25; // 검은색처럼 “조금만” 움직이려면 0.15~0.30 추천
+
+/**
+ * =========================
+ *  Ring helpers
+ * =========================
+ */
+function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
+  const outerRing = polygon.getCoordinates()[0] ?? [];
+  if (outerRing.length < 2) return [...outerRing];
+  const first = outerRing[0];
+  const last = outerRing[outerRing.length - 1];
+  const isClosed = first[0] === last[0] && first[1] === last[1];
+  return isClosed ? outerRing.slice(0, -1) : [...outerRing];
+}
+
+function createClosedRing(ring: Coordinate[]): Coordinate[] {
+  if (ring.length === 0) return [];
+  return [...ring, [...ring[0]]];
+}
+
+function inRange(value: number, min: number, max: number): boolean {
+  return value >= min && value <= max;
+}
+
+/**
+ * (표시/범위판정용) 내각(0~180)
+ */
+function calculateInteriorAngle(prev: Coordinate, current: Coordinate, next: Coordinate): number | null {
+  const bax = prev[0] - current[0];
+  const bay = prev[1] - current[1];
+  const bcx = next[0] - current[0];
+  const bcy = next[1] - current[1];
+
+  const baLength = Math.hypot(bax, bay);
+  const bcLength = Math.hypot(bcx, bcy);
+  if (baLength === 0 || bcLength === 0) return null;
+
+  const cosine = (bax * bcx + bay * bcy) / (baLength * bcLength);
+  const clamped = Math.max(-1, Math.min(1, cosine));
+  const angle = (Math.acos(clamped) * 180) / Math.PI;
+  return Number.isFinite(angle) ? angle : null;
+}
+
+function getAngleAtIndex(ring: Coordinate[], index: number): number | null {
+  const n = ring.length;
+  const prev = ring[(index - 1 + n) % n];
+  const cur = ring[index];
+  const next = ring[(index + 1) % n];
+  return calculateInteriorAngle(prev, cur, next);
+}
+
+function isAngleInRange(interiorAngle: number | null, min: number, max: number): boolean {
+  if (interiorAngle === null || !Number.isFinite(interiorAngle)) return false;
+  const exterior = 360 - interiorAngle;
+  return inRange(interiorAngle, min, max) || inRange(exterior, min, max);
+}
+
+/**
+ * =========================
+ *  Math helpers
+ * =========================
+ */
+function dot(ax: number, ay: number, bx: number, by: number): number {
+  return ax * bx + ay * by;
+}
+function clamp01(x: number): number {
+  return Math.max(0, Math.min(1, x));
+}
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+/**
+ * normalized dot (cos)
+ */
+function normalizedDot(ax: number, ay: number, bx: number, by: number): number | null {
+  const la = Math.hypot(ax, ay);
+  const lb = Math.hypot(bx, by);
+  if (la === 0 || lb === 0) return null;
+  return (ax * bx + ay * by) / (la * lb);
+}
+
+/**
+ * =========================
+ *  핵심: "최소 이동"으로 (P-A) ⟂ (Q-B) 만족
+ * =========================
+ *
+ * 고정: A, B
+ * 원래: P0, Q0
+ * 목표: P, Q를 찾되 이동량 ||P-P0||^2 + ||Q-Q0||^2 최소
+ * 제약: (P-A)·(Q-B) = 0  (직각)
+ *
+ * 1D 라그랑주 승수 λ를 뉴턴(수치미분)으로 근에서 찾는다.
+ * - λ=0이면 P=P0,Q=Q0
+ * - 우리는 "원본과 가장 가까운" 해를 원하므로 0 근처의 해를 찾는 게 맞음
+ */
+function solveMinMovePerpendicular(
+  A: Coordinate,
+  B: Coordinate,
+  P0: Coordinate,
+  Q0: Coordinate
+): { P: Coordinate; Q: Coordinate } | null {
+  const v0x = P0[0] - A[0];
+  const v0y = P0[1] - A[1];
+  const u0x = Q0[0] - B[0];
+  const u0y = Q0[1] - B[1];
+
+  // 이미 충분히 직각이면 그대로
+  const nd0 = normalizedDot(v0x, v0y, u0x, u0y);
+  if (nd0 !== null && Math.abs(nd0) <= DOT_TOL) {
+    return { P: [P0[0], P0[1]], Q: [Q0[0], Q0[1]] };
+  }
+
+  // λ -> (P,Q) 재구성 함수
+  const computePQ = (lambda: number): { P: Coordinate; Q: Coordinate; c: number } | null => {
+    // α = 1 - λ^2/4
+    const alpha = 1 - (lambda * lambda) / 4;
+    if (Math.abs(alpha) < 1e-9) return null;
+
+    // v = (v0 - (λ/2)u0)/α
+    const vx = (v0x - (lambda / 2) * u0x) / alpha;
+    const vy = (v0y - (lambda / 2) * u0y) / alpha;
+
+    // u = u0 - (λ/2)v
+    const ux = u0x - (lambda / 2) * vx;
+    const uy = u0y - (lambda / 2) * vy;
+
+    // constraint c = v·u (목표 0) - 정규화 없이도 되지만 스케일 민감 -> 정규화 cos도 체크
+    const c = vx * ux + vy * uy;
+
+    const P: Coordinate = [A[0] + vx, A[1] + vy];
+    const Q: Coordinate = [B[0] + ux, B[1] + uy];
+    return { P, Q, c };
+  };
+
+  // 뉴턴(수치미분)로 c(λ)=0 찾기, 0 근처
+  let lambda = 0;
+  let lastAbsC = Number.POSITIVE_INFINITY;
+
+  for (let iter = 0; iter < 30; iter += 1) {
+    const base = computePQ(lambda);
+    if (!base) return null;
+
+    const absC = Math.abs(base.c);
+    // constraint가 충분히 작으면 종료
+    if (absC <= 1e-8) return { P: base.P, Q: base.Q };
+
+    // 수치 미분
+    const h = 1e-4;
+    const plus = computePQ(lambda + h);
+    const minus = computePQ(lambda - h);
+    if (!plus || !minus) return null;
+
+    const dcdl = (plus.c - minus.c) / (2 * h);
+    if (!Number.isFinite(dcdl) || Math.abs(dcdl) < 1e-12) {
+      // 뉴턴이 불안정하면 작은 스텝으로 λ를 줄이는 방향(감쇠) 시도
+      lambda *= 0.5;
+      continue;
+    }
+
+    // 뉴턴 스텝
+    let step = base.c / dcdl;
+
+    // 너무 큰 스텝 제한(원본 유지)
+    const maxStep = 2.0;
+    if (step > maxStep) step = maxStep;
+    if (step < -maxStep) step = -maxStep;
+
+    const candidateLambda = lambda - step;
+    const cand = computePQ(candidateLambda);
+    if (!cand) {
+      lambda *= 0.5;
+      continue;
+    }
+
+    // 개선(제약 감소)이면 채택, 아니면 감쇠
+    if (Math.abs(cand.c) < absC) {
+      lambda = candidateLambda;
+      lastAbsC = Math.abs(cand.c);
+    } else {
+      lambda = lerp(lambda, candidateLambda, 0.3);
+    }
+
+    // 더 이상 개선이 없으면 탈출
+    if (absC >= lastAbsC && iter > 6) break;
+  }
+
+  // 마지막 λ로 결과 생성
+  const res = computePQ(lambda);
+  if (!res) return null;
+  return { P: res.P, Q: res.Q };
+}
+
+/**
+ * 이동 과도 방지: 한 번에 너무 멀리 이동하면 비율로 클램프
+ */
+function clampMove(
+  original: Coordinate,
+  candidate: Coordinate,
+  maxDistance: number
+): Coordinate {
+  const dx = candidate[0] - original[0];
+  const dy = candidate[1] - original[1];
+  const d = Math.hypot(dx, dy);
+  if (d <= maxDistance || d === 0) return candidate;
+  const t = maxDistance / d;
+  return [original[0] + dx * t, original[1] + dy * t];
+}
+
+/**
+ * =========================
+ *  이미지 요구: (i, i+1) 두 점이 범위면, i와 i+1 이동
+ *   A=i-1, B=i+2 고정
+ *   (P-A) ⟂ (Q-B) 되게 "최소 이동" 솔루션 적용
+ * =========================
+ */
+function adjustPairSequentialMinMove(
+  ring: Coordinate[],
+  i: number,
+  rangeMin: number,
+  rangeMax: number
+): { moved: boolean; movedVertices: number } {
+  const n = ring.length;
+  if (n < 4) return { moved: false, movedVertices: 0 };
+
+  const pIdx = i;
+  const qIdx = (i + 1) % n;
+  const aIdx = (i - 1 + n) % n;
+  const bIdx = (i + 2) % n;
+
+  const angleP = getAngleAtIndex(ring, pIdx);
+  const angleQ = getAngleAtIndex(ring, qIdx);
+
+  // 이미지 설명: "예: 1,11번 꼭지점의 각도가 범위이면" -> 두 꼭지점 모두 범위일 때만 처리
+  if (!isAngleInRange(angleP, rangeMin, rangeMax) || !isAngleInRange(angleQ, rangeMin, rangeMax)) {
+    return { moved: false, movedVertices: 0 };
+  }
+
+  const A = ring[aIdx];
+  const B = ring[bIdx];
+  const P0 = ring[pIdx];
+  const Q0 = ring[qIdx];
+
+  // 현재 (P0-A) 와 (Q0-B) 가 충분히 직각이면 skip
+  const v0x = P0[0] - A[0];
+  const v0y = P0[1] - A[1];
+  const u0x = Q0[0] - B[0];
+  const u0y = Q0[1] - B[1];
+
+  const nd = normalizedDot(v0x, v0y, u0x, u0y);
+  if (nd !== null) {
+    // 각도 기준으로도 필터링(너무 자주 건드리지 않게)
+    const angle = Math.acos(Math.max(-1, Math.min(1, nd))) * (180 / Math.PI);
+    if (Math.abs(angle - 90) <= ANGLE_TOL_DEG) {
+      return { moved: false, movedVertices: 0 };
+    }
+  }
+
+  const solved = solveMinMovePerpendicular(A, B, P0, Q0);
+  if (!solved) return { moved: false, movedVertices: 0 };
+
+  // 이동량 클램프(형상 보존)
+  const maxMoveP = Math.hypot(v0x, v0y) * MAX_MOVE_RATIO;
+  const maxMoveQ = Math.hypot(u0x, u0y) * MAX_MOVE_RATIO;
+
+  const P = clampMove(P0, solved.P, maxMoveP);
+  const Q = clampMove(Q0, solved.Q, maxMoveQ);
+
+  ring[pIdx] = P;
+  ring[qIdx] = Q;
+
+  return { moved: true, movedVertices: 2 };
+}
+
+/**
+ * =========================
+ *  Main API
+ * =========================
+ * - 1..N 순차 처리
+ * - 한 번 바꾼 뒤 즉시 다음 꼭지점 각도 재계산(순차)
+ * - 여러 pass로 수렴
+ */
+export function adjustPolygonAnglesToRight(
+  vectorSource: VectorSource<Feature<Polygon>>,
+  minAngle: number,
+  maxAngle: number
+): AngleAdjustResult {
+  const normalizedMin = Math.max(0, Math.min(360, minAngle));
+  const normalizedMax = Math.max(0, Math.min(360, maxAngle));
+  const rangeMin = Math.min(normalizedMin, normalizedMax);
+  const rangeMax = Math.max(normalizedMin, normalizedMax);
+
+  let updatedPolygons = 0;
+  let updatedVertices = 0;
+
+  for (const feature of vectorSource.getFeatures()) {
+    const geometry = feature.getGeometry();
+    if (!geometry || geometry.getType() !== "Polygon") continue;
+
+    const polygon = geometry as Polygon;
+    const baseRing = getRingWithoutClosure(polygon);
+    if (baseRing.length < 4) continue;
+
+    const ring = baseRing.map((c) => [c[0], c[1]] as Coordinate);
+
+    let anyChange = false;
+
+    for (let pass = 0; pass < MAX_PASSES; pass += 1) {
+      let changedThisPass = false;
+
+      // 포인트 순서대로 진행
+      for (let i = 0; i < ring.length; i += 1) {
+        const { moved, movedVertices } = adjustPairSequentialMinMove(ring, i, rangeMin, rangeMax);
+        if (moved) {
+          changedThisPass = true;
+          anyChange = true;
+          updatedVertices += movedVertices;
+          // 요구사항: 업데이트 후 다음 꼭지점 각도 계산 -> ring이 바로 갱신되어 다음 i에서 반영됨
+        }
+      }
+
+      if (!changedThisPass) break;
+    }
+
+    if (!anyChange) continue;
+
+    polygon.setCoordinates([createClosedRing(ring)]);
+    updatedPolygons += 1;
+  }
+
+  if (updatedPolygons > 0) vectorSource.changed();
+  return { updatedPolygons, updatedVertices };
+}
+
+/**
+ * (선택) 각 꼭지점 각도 라벨
+ */
+export function buildVertexAngleStyles(polygon: Polygon): Style[] {
+  const ring = getRingWithoutClosure(polygon);
+  if (ring.length < 3) return [];
+
+  const styles: Style[] = [];
+  for (let index = 0; index < ring.length; index += 1) {
+    const prev = ring[(index - 1 + ring.length) % ring.length];
+    const cur = ring[index];
+    const next = ring[(index + 1) % ring.length];
+    const angle = calculateInteriorAngle(prev, cur, next);
+    if (angle === null) continue;
+
+    styles.push(
+      new Style({
+        geometry: new Point(cur),
+        image: vertexMarker,
+        text: new TextStyle({
+          text: `${angle.toFixed(1)}°`,
+          offsetY: -12,
+          textAlign: "center",
+          textBaseline: "bottom",
+          font: "12px sans-serif",
+          fill: angleTextFill,
+          stroke: angleTextStroke
+        })
+      })
+    );
+  }
+  return styles;
+}
