@@ -1,0 +1,180 @@
+import type Feature from "ol/Feature";
+import type Polygon from "ol/geom/Polygon";
+import type { Coordinate } from "ol/coordinate";
+
+import proj4 from "proj4";
+import { register } from "ol/proj/proj4";
+import { get as getProjection, transform as olTransform } from "ol/proj";
+
+/**
+ * EPSG:5179(UTM-K, GRS80) 등록 (한 번만 호출되도록 가드)
+ * - OpenLayers의 transform()을 사용하기 위해 proj4 등록
+ */
+let _epsg5179Ready = false;
+export function ensureEPSG5179(): void {
+  if (_epsg5179Ready) return;
+
+  // EPSG:5179 (Korea 2000 / Unified CS)
+  proj4.defs(
+    "EPSG:5179",
+    "+proj=tmerc +lat_0=38 +lon_0=127.5 +k=0.9996 +x_0=1000000 +y_0=2000000 +ellps=GRS80 +units=m +no_defs"
+  );
+  register(proj4);
+
+  // 존재 확인(미등록이면 transform에서 오류 가능)
+  getProjection("EPSG:5179");
+
+  _epsg5179Ready = true;
+}
+
+function interiorAngleDeg(A: Coordinate, B: Coordinate, C: Coordinate): number {
+  const ux = A[0] - B[0];
+  const uy = A[1] - B[1];
+  const vx = C[0] - B[0];
+  const vy = C[1] - B[1];
+
+  const dot = ux * vx + uy * vy;
+  const cross = ux * vy - uy * vx;
+  const rad = Math.atan2(Math.abs(cross), dot); // 0..PI (안정적)
+  return (rad * 180) / Math.PI;
+}
+
+function dist(a: Coordinate, b: Coordinate): number {
+  return Math.hypot(a[0] - b[0], a[1] - b[1]);
+}
+function sub(a: Coordinate, b: Coordinate): Coordinate {
+  return [a[0] - b[0], a[1] - b[1]];
+}
+function add(a: Coordinate, b: Coordinate): Coordinate {
+  return [a[0] + b[0], a[1] + b[1]];
+}
+function mul(v: Coordinate, s: number): Coordinate {
+  return [v[0] * s, v[1] * s];
+}
+function normalize(v: Coordinate): Coordinate | null {
+  const len = Math.hypot(v[0], v[1]);
+  if (len < 1e-12) return null;
+  return [v[0] / len, v[1] / len];
+}
+
+/**
+ * A, C 고정 + B만 "최소 이동"하여 ∠ABC = 90°가 되도록 보정.
+ * - ∠ABC=90°를 만족하는 B의 자취: AC를 지름으로 하는 원(탈레스 원)
+ * - B0에서 그 원까지의 최단 이동점: 중심 M에서 B0 방향으로 반지름 r로 투영한 점
+ */
+function snapBToRightAngleMinMove(A: Coordinate, B0: Coordinate, C: Coordinate): Coordinate | null {
+  const M: Coordinate = [(A[0] + C[0]) / 2, (A[1] + C[1]) / 2];
+  const AC = dist(A, C);
+  if (AC < 1e-9) return null;
+  const r = AC / 2;
+
+  const w = sub(B0, M);
+  const wn = normalize(w);
+  if (wn) return add(M, mul(wn, r));
+
+  // B0 == M 극단 케이스: AC에 수직 방향으로 임의 선택
+  const dir = normalize(sub(C, A));
+  if (!dir) return null;
+  const perp: Coordinate = [-dir[1], dir[0]];
+  return add(M, mul(perp, r));
+}
+
+/**
+ * (핵심) 화면좌표(EPSG:3857) Polygon Feature들을
+ * - 좌표를 EPSG:5179로 변환해서 각도 계산/보정(정확)
+ * - 결과를 다시 EPSG:3857로 변환하여 geometry 좌표 업데이트
+ *
+ * @param features Polygon feature 목록 (현재 좌표계 EPSG:3857)
+ * @param minAngleDeg 보정 대상 최소각(예: 75)
+ * @param maxAngleDeg 보정 대상 최대각(예: 110)
+ */
+export function updatePolygonsRightAngleByMovingBMin_With5179(
+  features: Array<Feature<Polygon>>,
+  minAngleDeg: number,
+  maxAngleDeg: number
+): {
+  featureCount: number;
+  updatedFeatureCount: number;
+  updatedVertexCount: number;
+} {
+  ensureEPSG5179();
+
+  const SRC = "EPSG:3857";
+  const DST = "EPSG:5179";
+
+  let updatedFeatureCount = 0;
+  let updatedVertexCount = 0;
+
+  for (const feature of features) {
+    const geom = feature.getGeometry();
+    if (!geom) continue;
+
+    const rings3857 = geom.getCoordinates(); // Polygon: Coordinate[][]
+    if (!rings3857.length) continue;
+
+    // 1) 3857 -> 5179 변환 (각도/거리 계산은 5179에서)
+    const rings5179 = rings3857.map((ring) =>
+      ring.map((c) => olTransform(c, SRC, DST) as Coordinate)
+    );
+
+    let featureUpdated = false;
+
+    // 2) 5179에서 보정 수행
+    const newRings5179 = rings5179.map((ring) => {
+      if (ring.length < 4) return ring;
+
+      // 닫힘점 제외한 유효 꼭지점 수
+      const n = ring.length - 1;
+
+      const isClosed =
+        ring[0][0] === ring[ring.length - 1][0] &&
+        ring[0][1] === ring[ring.length - 1][1];
+
+      const baseRing = isClosed ? ring.slice(0, n) : ring.slice();
+      const m = baseRing.length;
+      if (m < 3) return ring;
+
+      const out = baseRing.map((p) => [p[0], p[1]] as Coordinate);
+
+      for (let i = 0; i < m; i++) {
+        const iPrev = (i - 1 + m) % m;
+        const iNext = (i + 1) % m;
+
+        const A = out[iPrev];
+        const B0 = out[i];
+        const C = out[iNext];
+
+        const ang = interiorAngleDeg(A, B0, C);
+        if (ang < minAngleDeg || ang > maxAngleDeg) continue;
+
+        const B1 = snapBToRightAngleMinMove(A, B0, C);
+        if (!B1) continue;
+
+        out[i] = B1;
+        updatedVertexCount++;
+        featureUpdated = true;
+      }
+
+      // 링 닫기
+      out.push([out[0][0], out[0][1]]);
+      return out;
+    });
+
+    if (!featureUpdated) continue;
+
+    // 3) 5179 -> 3857 역변환 후 geometry 업데이트
+    const newRings3857 = newRings5179.map((ring) =>
+      ring.map((c) => olTransform(c, DST, SRC) as Coordinate)
+    );
+
+    geom.setCoordinates(newRings3857);
+    feature.changed();
+    updatedFeatureCount++;
+  }
+
+  return {
+    featureCount: features.length,
+    updatedFeatureCount,
+    updatedVertexCount,
+  };
+}
