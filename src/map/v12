@@ -1,0 +1,632 @@
+import Draw from "ol/interaction/Draw";
+import Map from "ol/Map";
+import View from "ol/View";
+import OSM from "ol/source/OSM";
+import TileLayer from "ol/layer/Tile";
+import VectorLayer from "ol/layer/Vector";
+import VectorSource from "ol/source/Vector";
+import Point from "ol/geom/Point";
+import { Fill, Stroke, Style, Circle as CircleStyle, Text as TextStyle } from "ol/style";
+import type { Coordinate } from "ol/coordinate";
+import type Feature from "ol/Feature";
+import type Polygon from "ol/geom/Polygon";
+
+// ✅ EPSG 변환(3857 -> 5179) 추가
+import proj4 from "proj4";
+import { register } from "ol/proj/proj4";
+import { transform as projTransform } from "ol/proj";
+
+/**
+ * ------------------------------------------------------------
+ * EPSG 설정/등록
+ * - 계산(각도/솔버)은 EPSG:5179에서
+ * - 렌더링/geometry 저장은 EPSG:3857에서
+ * ------------------------------------------------------------
+ */
+const SRC_EPSG = "EPSG:3857";
+const CALC_EPSG = "EPSG:5179";
+
+// EPSG:5179 (KGD2002 / Unified CS) 정의 등록 (epsg.io PROJ.4 기반)
+proj4.defs(
+  CALC_EPSG,
+  "+proj=tmerc +lat_0=38 +lon_0=127.5 +k=0.9996 +x_0=1000000 +y_0=2000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs +type=crs"
+);
+register(proj4);
+
+function to5179(coord3857: Coordinate): Coordinate {
+  return projTransform(coord3857, SRC_EPSG, CALC_EPSG) as Coordinate;
+}
+
+function to3857(coord5179: Coordinate): Coordinate {
+  return projTransform(coord5179, CALC_EPSG, SRC_EPSG) as Coordinate;
+}
+
+/**
+ * 폴리곤/라벨 기본 렌더 스타일 정의.
+ */
+const polygonFill = new Fill({ color: "rgba(0, 153, 255, 0.22)" });
+const polygonStroke = new Stroke({ color: "#005fa3", width: 2 });
+const vertexMarker = new CircleStyle({
+  radius: 5,
+  fill: new Fill({ color: "#005fa3" }),
+  stroke: new Stroke({ color: "#ffffff", width: 1.5 })
+});
+const angleTextFill = new Fill({ color: "#0b2a42" });
+const angleTextStroke = new Stroke({ color: "#ffffff", width: 3 });
+const polygonBaseStyle = new Style({
+  fill: polygonFill,
+  stroke: polygonStroke
+});
+
+/**
+ * 각도 보정 엔진 파라미터.
+ */
+const TARGET_ANGLE = 90;
+const TARGET_TOLERANCE = 0.001;
+const REGULARIZATION_WEIGHT = 1e-6;
+const NUMERIC_DIFF_STEP = 1e-3;
+const MAX_SOLVER_ITERATIONS = 60;
+const MAX_FALLBACK_ITERATIONS = 160;
+
+export type PolygonMapContext = {
+  map: Map;
+  vectorSource: VectorSource<Feature<Polygon>>;
+};
+
+type AngleAdjustResult = {
+  updatedPolygons: number;
+  updatedVertices: number;
+};
+
+/**
+ * OpenLayers Polygon 외곽 링에서 중복 폐합점을 제거한다.
+ */
+function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
+  const outerRing = polygon.getCoordinates()[0] ?? [];
+  if (outerRing.length < 2) return [...outerRing];
+
+  const first = outerRing[0];
+  const last = outerRing[outerRing.length - 1];
+  const isClosed = first[0] === last[0] && first[1] === last[1];
+  return isClosed ? outerRing.slice(0, -1) : [...outerRing];
+}
+
+/**
+ * "현재 polygon 좌표"를 읽어서 5179 링을 만든다 (각도/솔버용).
+ */
+function getRingWithoutClosure5179(polygon: Polygon): Coordinate[] {
+  return getRingWithoutClosure(polygon).map(to5179);
+}
+
+/**
+ * 링을 OpenLayers 좌표 형식(폐합 포함)으로 되돌린다.
+ * 예: [A,B,C] -> [A,B,C,A]
+ */
+function createClosedRing(ring: Coordinate[]): Coordinate[] {
+  if (ring.length === 0) return [];
+  return [...ring, [...ring[0]]];
+}
+
+/** 범위 비교 유틸(경계 포함). */
+function inRange(value: number, min: number, max: number): boolean {
+  return value >= min && value <= max;
+}
+
+/* ------------------------------------------------------------------
+ * ✅ 패치 1) 링 방향(CCW/CW) + signed 내각 계산(0~360, 오목각 포함)
+ * ------------------------------------------------------------------ */
+
+/** shoelace의 signed area로 CCW 여부 판단 */
+function ringIsCCW(ring: Coordinate[]): boolean {
+  let area2 = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i];
+    const b = ring[(i + 1) % ring.length];
+    area2 += a[0] * b[1] - b[0] * a[1];
+  }
+  return area2 > 0;
+}
+
+/**
+ * prev-current-next에서 current의 "진짜 내각"(0~360)을 계산.
+ * - atan2(|cross|, dot)로 기본각(0~180)
+ * - 링 방향과 cross 부호로 reflex(>180) 여부 판단하여 360-기본각 적용
+ */
+function calculateInteriorAngle360(
+  prev: Coordinate,
+  current: Coordinate,
+  next: Coordinate,
+  isCCW: boolean
+): number | null {
+  const bax = prev[0] - current[0];
+  const bay = prev[1] - current[1];
+  const bcx = next[0] - current[0];
+  const bcy = next[1] - current[1];
+
+  const baLen = Math.hypot(bax, bay);
+  const bcLen = Math.hypot(bcx, bcy);
+  if (baLen === 0 || bcLen === 0) return null;
+
+  const dot = bax * bcx + bay * bcy;
+  const cross = bax * bcy - bay * bcx;
+
+  // 0~180
+  const base = (Math.atan2(Math.abs(cross), dot) * 180) / Math.PI;
+
+  // reflex 판정(일반적인 simple ring 가정)
+  // CCW면 cross < 0일 때 reflex가 되는 경우가 많고, CW면 반대
+  const isReflex = isCCW ? cross < 0 : cross > 0;
+
+  const interior = isReflex ? 360 - base : base;
+  return Number.isFinite(interior) ? interior : null;
+}
+
+/** 링 인덱스의 내각(0~360)을 순환 인덱싱으로 계산한다. */
+function getAngleAtIndex(ring: Coordinate[], index: number, isCCW: boolean): number | null {
+  const length = ring.length;
+  const prev = ring[(index - 1 + length) % length];
+  const current = ring[index];
+  const next = ring[(index + 1) % length];
+  return calculateInteriorAngle360(prev, current, next, isCCW);
+}
+
+/**
+ * 범위 매칭 대상 꼭지점 인덱스를 수집한다.
+ * 조건:
+ * - 내각 θ 가 [min,max] 이거나
+ * - 외각 (360-θ) 가 [min,max]
+ *
+ * ✅ 패치: 내각이 0~360 기준이므로 오목각도 정확히 처리됨
+ */
+function collectTargetVertexIndices(ring: Coordinate[], min: number, max: number): number[] {
+  const indices: number[] = [];
+  const isCCW = ringIsCCW(ring);
+
+  for (let index = 0; index < ring.length; index += 1) {
+    const interior = getAngleAtIndex(ring, index, isCCW);
+    if (interior === null) continue;
+
+    const exterior = 360 - interior;
+    if (inRange(interior, min, max) || inRange(exterior, min, max)) {
+      indices.push(index);
+    }
+  }
+  return indices;
+}
+
+/* ------------------------------------------------------------------
+ * 기존 moveVertexToRightAngle / fallback 은 그대로 사용
+ * (단, 각도 계산은 360 버전으로 교체)
+ * ------------------------------------------------------------------ */
+
+/**
+ * 한 꼭지점을 "직각 제약에 가까운 위치"로 이동시키는 기하 유틸.
+ * - A(prev), C(next)를 지름 양끝으로 보는 원 위의 임의 점 B는 ∠ABC=90°를 만족
+ * - current를 그 원 위로 투영
+ */
+function moveVertexToRightAngle(prev: Coordinate, current: Coordinate, next: Coordinate): Coordinate | null {
+  const midX = (prev[0] + next[0]) / 2;
+  const midY = (prev[1] + next[1]) / 2;
+  const radius = Math.hypot(next[0] - prev[0], next[1] - prev[1]) / 2;
+  if (radius === 0) return null;
+
+  const toCurrentX = current[0] - midX;
+  const toCurrentY = current[1] - midY;
+  const toCurrentLength = Math.hypot(toCurrentX, toCurrentY);
+  if (toCurrentLength > 0) {
+    const scale = radius / toCurrentLength;
+    return [midX + toCurrentX * scale, midY + toCurrentY * scale];
+  }
+
+  const edgeX = next[0] - prev[0];
+  const edgeY = next[1] - prev[1];
+  const edgeLength = Math.hypot(edgeX, edgeY);
+  if (edgeLength === 0) return null;
+
+  const unitPerp: Coordinate = [-edgeY / edgeLength, edgeX / edgeLength];
+  const candidateA: Coordinate = [midX + unitPerp[0] * radius, midY + unitPerp[1] * radius];
+  const candidateB: Coordinate = [midX - unitPerp[0] * radius, midY - unitPerp[1] * radius];
+  const distanceA = Math.hypot(candidateA[0] - current[0], candidateA[1] - current[1]);
+  const distanceB = Math.hypot(candidateB[0] - current[0], candidateB[1] - current[1]);
+  return distanceA <= distanceB ? candidateA : candidateB;
+}
+
+/* ------------------------------------------------------------------
+ * ✅ 패치 2) "움직일 수 있는 점" 정책
+ *  - 1차: 타깃만 이동
+ *  - 2차(실패 시): 타깃 + 이웃 포함
+ * ------------------------------------------------------------------ */
+
+function buildMovableIndicesTargetOnly(targetIndices: number[]): number[] {
+  return [...new Set(targetIndices)].sort((a, b) => a - b);
+}
+
+function buildMovableIndicesWithNeighbors(ringLength: number, targetIndices: number[]): number[] {
+  const selected = new Set<number>();
+  for (const index of targetIndices) {
+    selected.add(index);
+    selected.add((index - 1 + ringLength) % ringLength);
+    selected.add((index + 1) % ringLength);
+  }
+  return [...selected].sort((a, b) => a - b);
+}
+
+/**
+ * 변수 벡터([x0,y0,x1,y1,...])를 링 좌표에 반영해 후보 링을 만든다.
+ */
+function applySolvedCoordinates(baseRing: Coordinate[], movableIndices: number[], variables: number[]): Coordinate[] {
+  const candidate = baseRing.map((coord) => [coord[0], coord[1]] as Coordinate);
+  for (let variableIndex = 0; variableIndex < movableIndices.length; variableIndex += 1) {
+    const vertexIndex = movableIndices[variableIndex];
+    const x = variables[variableIndex * 2];
+    const y = variables[variableIndex * 2 + 1];
+    candidate[vertexIndex] = [x, y];
+  }
+  return candidate;
+}
+
+/**
+ * 제약 잔차 벡터 r: 각 대상 i에 대해 r_i = angle_i - 90.
+ * ✅ 패치: angle_i는 0~360 내각
+ */
+function computeConstraintResiduals(ring: Coordinate[], targetIndices: number[]): number[] {
+  const isCCW = ringIsCCW(ring);
+  return targetIndices.map((index) => {
+    const angle = getAngleAtIndex(ring, index, isCCW);
+    if (angle === null || !Number.isFinite(angle)) return Number.NaN;
+    return angle - TARGET_ANGLE;
+  });
+}
+
+function computeMaxAbs(values: number[]): number {
+  let maxAbs = 0;
+  for (const value of values) {
+    const abs = Math.abs(value);
+    if (abs > maxAbs) maxAbs = abs;
+  }
+  return maxAbs;
+}
+
+function sumSquares(values: number[]): number {
+  return values.reduce((sum, value) => sum + value * value, 0);
+}
+
+function numericJacobian(
+  variables: number[],
+  residualFunction: (candidate: number[]) => number[]
+): number[][] | null {
+  const baseResidual = residualFunction(variables);
+  if (baseResidual.some((value) => !Number.isFinite(value))) return null;
+
+  const jacobian = baseResidual.map(() => new Array<number>(variables.length).fill(0));
+  for (let column = 0; column < variables.length; column += 1) {
+    const plus = [...variables];
+    const minus = [...variables];
+    plus[column] += NUMERIC_DIFF_STEP;
+    minus[column] -= NUMERIC_DIFF_STEP;
+
+    const plusResidual = residualFunction(plus);
+    const minusResidual = residualFunction(minus);
+    if (
+      plusResidual.some((value) => !Number.isFinite(value)) ||
+      minusResidual.some((value) => !Number.isFinite(value))
+    ) {
+      return null;
+    }
+
+    for (let row = 0; row < baseResidual.length; row += 1) {
+      jacobian[row][column] = (plusResidual[row] - minusResidual[row]) / (2 * NUMERIC_DIFF_STEP);
+    }
+  }
+  return jacobian;
+}
+
+function solveLinearSystem(matrix: number[][], vector: number[]): number[] | null {
+  const size = vector.length;
+  const augmented = matrix.map((row, index) => [...row, vector[index]]);
+
+  for (let pivotIndex = 0; pivotIndex < size; pivotIndex += 1) {
+    let maxRow = pivotIndex;
+    let maxValue = Math.abs(augmented[pivotIndex][pivotIndex]);
+    for (let row = pivotIndex + 1; row < size; row += 1) {
+      const value = Math.abs(augmented[row][pivotIndex]);
+      if (value > maxValue) {
+        maxValue = value;
+        maxRow = row;
+      }
+    }
+    if (maxValue < 1e-12) return null;
+
+    if (maxRow !== pivotIndex) {
+      const temp = augmented[pivotIndex];
+      augmented[pivotIndex] = augmented[maxRow];
+      augmented[maxRow] = temp;
+    }
+
+    const pivot = augmented[pivotIndex][pivotIndex];
+    for (let column = pivotIndex; column <= size; column += 1) {
+      augmented[pivotIndex][column] /= pivot;
+    }
+
+    for (let row = 0; row < size; row += 1) {
+      if (row === pivotIndex) continue;
+      const factor = augmented[row][pivotIndex];
+      if (factor === 0) continue;
+      for (let column = pivotIndex; column <= size; column += 1) {
+        augmented[row][column] -= factor * augmented[pivotIndex][column];
+      }
+    }
+  }
+
+  return augmented.map((row) => row[size]);
+}
+
+/**
+ * ✅ solveRightAngleConstraints: movableIndices를 외부에서 주입(정책 분리)
+ */
+function solveRightAngleConstraints(
+  baseRing: Coordinate[],
+  targetIndices: number[],
+  movableIndices: number[],
+  tolerance: number
+): Coordinate[] | null {
+  if (movableIndices.length === 0) return null;
+
+  const initialVariables: number[] = [];
+  for (const vertexIndex of movableIndices) {
+    initialVariables.push(baseRing[vertexIndex][0], baseRing[vertexIndex][1]);
+  }
+
+  let variables = [...initialVariables];
+  let damping = 1e-3;
+
+  const residualFunction = (candidateVariables: number[]): number[] => {
+    const candidateRing = applySolvedCoordinates(baseRing, movableIndices, candidateVariables);
+    return computeConstraintResiduals(candidateRing, targetIndices);
+  };
+
+  for (let iteration = 0; iteration < MAX_SOLVER_ITERATIONS; iteration += 1) {
+    const residual = residualFunction(variables);
+    if (residual.some((value) => !Number.isFinite(value))) return null;
+
+    const maxError = computeMaxAbs(residual);
+    if (maxError <= tolerance) {
+      return applySolvedCoordinates(baseRing, movableIndices, variables);
+    }
+
+    const jacobian = numericJacobian(variables, residualFunction);
+    if (!jacobian) return null;
+
+    const variableCount = variables.length;
+    const residualCount = residual.length;
+
+    const normalMatrix = Array.from({ length: variableCount }, () =>
+      new Array<number>(variableCount).fill(0)
+    );
+    const normalVector = new Array<number>(variableCount).fill(0);
+
+    for (let column = 0; column < variableCount; column += 1) {
+      for (let row = 0; row < residualCount; row += 1) {
+        normalVector[column] += jacobian[row][column] * residual[row];
+      }
+      normalVector[column] =
+        -normalVector[column] -
+        REGULARIZATION_WEIGHT * (variables[column] - initialVariables[column]);
+    }
+
+    for (let row = 0; row < variableCount; row += 1) {
+      for (let column = 0; column < variableCount; column += 1) {
+        let sum = 0;
+        for (let r = 0; r < residualCount; r += 1) {
+          sum += jacobian[r][row] * jacobian[r][column];
+        }
+        normalMatrix[row][column] = sum;
+      }
+      normalMatrix[row][row] += damping + REGULARIZATION_WEIGHT;
+    }
+
+    const delta = solveLinearSystem(normalMatrix, normalVector);
+    if (!delta) return null;
+
+    const candidateVariables = variables.map((value, index) => value + delta[index]);
+    const candidateResidual = residualFunction(candidateVariables);
+    if (candidateResidual.some((value) => !Number.isFinite(value))) {
+      damping *= 10;
+      continue;
+    }
+
+    const currentObjective =
+      sumSquares(residual) +
+      REGULARIZATION_WEIGHT *
+        variables.reduce((sum, value, index) => {
+          const diff = value - initialVariables[index];
+          return sum + diff * diff;
+        }, 0);
+
+    const candidateObjective =
+      sumSquares(candidateResidual) +
+      REGULARIZATION_WEIGHT *
+        candidateVariables.reduce((sum, value, index) => {
+          const diff = value - initialVariables[index];
+          return sum + diff * diff;
+        }, 0);
+
+    if (candidateObjective < currentObjective) {
+      variables = candidateVariables;
+      damping = Math.max(1e-6, damping * 0.5);
+    } else {
+      damping = Math.min(1e6, damping * 4);
+    }
+  }
+
+  const finalRing = applySolvedCoordinates(baseRing, movableIndices, variables);
+  const finalResidual = computeConstraintResiduals(finalRing, targetIndices);
+  if (finalResidual.some((value) => !Number.isFinite(value))) return null;
+
+  return computeMaxAbs(finalResidual) <= tolerance ? finalRing : null;
+}
+
+/**
+ * 정확해법 실패 시 사용하는 반복 보정 폴백.
+ * ✅ 패치: 각도 계산은 360버전으로
+ */
+function fallbackIterativeAdjust(
+  baseRing: Coordinate[],
+  targetIndices: number[],
+  tolerance: number
+): Coordinate[] | null {
+  const ring = baseRing.map((coord) => [coord[0], coord[1]] as Coordinate);
+
+  for (let iteration = 0; iteration < MAX_FALLBACK_ITERATIONS; iteration += 1) {
+    let changed = false;
+    let maxError = 0;
+
+    const isCCW = ringIsCCW(ring);
+
+    for (const index of targetIndices) {
+      const prev = ring[(index - 1 + ring.length) % ring.length];
+      const current = ring[index];
+      const next = ring[(index + 1) % ring.length];
+
+      const angle = calculateInteriorAngle360(prev, current, next, isCCW);
+      if (angle === null) continue;
+
+      const error = Math.abs(angle - TARGET_ANGLE);
+      if (error > maxError) maxError = error;
+      if (error <= tolerance) continue;
+
+      const moved = moveVertexToRightAngle(prev, current, next);
+      if (!moved) continue;
+
+      ring[index] = moved;
+      changed = true;
+    }
+
+    if (maxError <= tolerance) return ring;
+    if (!changed) break;
+  }
+
+  const isCCW = ringIsCCW(ring);
+  let maxError = 0;
+  for (const index of targetIndices) {
+    const angle = getAngleAtIndex(ring, index, isCCW);
+    if (angle === null) return null;
+    const error = Math.abs(angle - TARGET_ANGLE);
+    if (error > maxError) maxError = error;
+  }
+  return maxError <= tolerance ? ring : null;
+}
+
+/* ------------------------------------------------------------------
+ * ✅ 패치 3) 라벨(각도 표시)도 360 내각 로직 사용
+ * ------------------------------------------------------------------ */
+function buildVertexAngleStyles(polygon: Polygon): Style[] {
+  const baseRing3857 = getRingWithoutClosure(polygon);
+  if (baseRing3857.length < 3) return [];
+
+  const ring5179 = baseRing3857.map(to5179);
+  const isCCW = ringIsCCW(ring5179);
+
+  const styles: Style[] = [];
+  for (let index = 0; index < baseRing3857.length; index += 1) {
+    // 최신 좌표 재확인
+    const freshRing3857 = getRingWithoutClosure(polygon);
+    if (freshRing3857.length < 3) return styles;
+
+    const fresh5179 = freshRing3857.map(to5179);
+    const len = fresh5179.length;
+
+    const prev = fresh5179[(index - 1 + len) % len];
+    const current = fresh5179[index];
+    const next = fresh5179[(index + 1) % len];
+
+    const angle = calculateInteriorAngle360(prev, current, next, ringIsCCW(fresh5179));
+    if (angle === null) continue;
+
+    const current3857 = freshRing3857[index];
+
+    styles.push(
+      new Style({
+        geometry: new Point(current3857),
+        image: vertexMarker,
+        text: new TextStyle({
+          text: `${angle.toFixed(1)}°`,
+          offsetY: -12,
+          textAlign: "center",
+          textBaseline: "bottom",
+          font: "12px sans-serif",
+          fill: angleTextFill,
+          stroke: angleTextStroke
+        })
+      })
+    );
+  }
+
+  return styles;
+}
+
+/**
+ * 벡터소스의 모든 폴리곤을 순회하여,
+ * 범위 조건을 만족하는 각도(내각 또는 외각)를 90도로 보정한다.
+ *
+ * ✅ 패치된 흐름:
+ * - 타깃 수집은 0~360 내각 기준
+ * - 솔버 1차: 타깃만 이동
+ * - 솔버 2차: 실패 시 타깃+이웃 이동
+ * - 그래도 실패하면 fallback
+ */
+export function adjustPolygonAnglesToRight(
+  vectorSource: VectorSource<Feature<Polygon>>,
+  minAngle: number,
+  maxAngle: number
+): AngleAdjustResult {
+  const normalizedMin = Math.max(0, Math.min(360, minAngle));
+  const normalizedMax = Math.max(0, Math.min(360, maxAngle));
+  const rangeMin = Math.min(normalizedMin, normalizedMax);
+  const rangeMax = Math.max(normalizedMin, normalizedMax);
+
+  let updatedPolygons = 0;
+  let updatedVertices = 0;
+
+  for (const feature of vectorSource.getFeatures()) {
+    const geometry = feature.getGeometry();
+    if (!geometry || geometry.getType() !== "Polygon") continue;
+
+    const polygon = geometry as Polygon;
+
+    const ring5179 = getRingWithoutClosure5179(polygon);
+    if (ring5179.length < 3) continue;
+
+    const targetIndices = collectTargetVertexIndices(ring5179, rangeMin, rangeMax);
+    if (targetIndices.length === 0) continue;
+
+    // ✅ 1차: 타깃만 이동
+    const movable1 = buildMovableIndicesTargetOnly(targetIndices);
+    let solvedRing5179 =
+      solveRightAngleConstraints(ring5179, targetIndices, movable1, TARGET_TOLERANCE);
+
+    // ✅ 2차: 실패 시 이웃 포함
+    if (!solvedRing5179) {
+      const movable2 = buildMovableIndicesWithNeighbors(ring5179.length, targetIndices);
+      solvedRing5179 =
+        solveRightAngleConstraints(ring5179, targetIndices, movable2, TARGET_TOLERANCE);
+    }
+
+    // ✅ 3차: 그래도 실패 시 fallback
+    if (!solvedRing5179) {
+      solvedRing5179 = fallbackIterativeAdjust(ring5179, targetIndices, TARGET_TOLERANCE);
+    }
+
+    if (!solvedRing5179) continue;
+
+    // 3857로 되돌려 적용
+    const solvedRing3857 = solvedRing5179.map(to3857);
+    polygon.setCoordinates([createClosedRing(solvedRing3857)]);
+
+    updatedPolygons += 1;
+    updatedVertices += targetIndices.length;
+  }
+
+  if (updatedPolygons > 0) vectorSource.changed();
+  return { updatedPolygons, updatedVertices };
+}
