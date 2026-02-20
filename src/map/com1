@@ -1,0 +1,217 @@
+/**
+ * 점 b를 a→b 방향 선분 위에서만 슬라이딩하여 ∠a-b-c = 90°를 만든다.
+ *
+ * b' = a + t*(b-a) 위에서 ∠a-b'-c = 90°
+ * → dot(b'-a, c-b') = 0
+ *   d = b-a, b' = a+t*d
+ *   dot(t*d, c-a-t*d) = 0
+ *   t = dot(d, c-a) / |d|^2
+ */
+function slideVertexAlongIncomingEdge(
+  prev: Coordinate,
+  current: Coordinate,
+  next: Coordinate
+): Coordinate | null {
+  const dx = current[0] - prev[0];
+  const dy = current[1] - prev[1];
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) {
+    return null;
+  }
+
+  const cax = next[0] - prev[0];
+  const cay = next[1] - prev[1];
+  const t = (dx * cax + dy * cay) / lenSq;
+
+  if (Math.abs(t) < 1e-10) {
+    return null;
+  }
+
+  return [prev[0] + t * dx, prev[1] + t * dy];
+}
+
+/**
+ * 입력 선분 방향으로만 슬라이딩하는 해석해 솔버.
+ * slideVertexAlongIncomingEdge 의 해석해가 존재하므로 반복 불필요.
+ */
+function solveRightAngleConstraints(
+  baseRing: Coordinate[],
+  targetIndices: number[],
+  tolerance: number
+): Coordinate[] | null {
+  const ring = baseRing.map((coord) => [coord[0], coord[1]] as Coordinate);
+  let allSolved = true;
+
+  for (const index of targetIndices) {
+    const prev = ring[(index - 1 + ring.length) % ring.length];
+    const current = ring[index];
+    const next = ring[(index + 1) % ring.length];
+
+    const moved = slideVertexAlongIncomingEdge(prev, current, next);
+    if (!moved) {
+      allSolved = false;
+      continue;
+    }
+
+    const angle = calculateInteriorAngle(prev, moved, next);
+    if (angle === null || Math.abs(angle - TARGET_ANGLE) > tolerance) {
+      allSolved = false;
+      continue;
+    }
+
+    ring[index] = moved;
+  }
+
+  return allSolved ? ring : null;
+}
+
+/**
+ * 정확해법 실패 시 사용하는 반복 보정 폴백.
+ * 입력 선분(prev→current) 방향으로만 슬라이딩.
+ */
+function fallbackIterativeAdjust(
+  baseRing: Coordinate[],
+  targetIndices: number[],
+  tolerance: number
+): Coordinate[] | null {
+  const ring = baseRing.map((coord) => [coord[0], coord[1]] as Coordinate);
+
+  for (let iteration = 0; iteration < MAX_FALLBACK_ITERATIONS; iteration += 1) {
+    let changed = false;
+    let maxError = 0;
+
+    for (const index of targetIndices) {
+      const prev = ring[(index - 1 + ring.length) % ring.length];
+      const current = ring[index];
+      const next = ring[(index + 1) % ring.length];
+      const angle = calculateInteriorAngle(prev, current, next);
+      if (angle === null) {
+        continue;
+      }
+
+      const error = Math.abs(angle - TARGET_ANGLE);
+      if (error > maxError) {
+        maxError = error;
+      }
+      if (error <= tolerance) {
+        continue;
+      }
+
+      const moved = slideVertexAlongIncomingEdge(prev, current, next);
+      if (!moved) {
+        continue;
+      }
+      ring[index] = moved;
+      changed = true;
+    }
+
+    if (maxError <= tolerance) {
+      return ring;
+    }
+    if (!changed) {
+      break;
+    }
+  }
+
+  let maxError = 0;
+  for (const index of targetIndices) {
+    const angle = getAngleAtIndex(ring, index);
+    if (angle === null) {
+      return null;
+    }
+    const error = Math.abs(angle - TARGET_ANGLE);
+    if (error > maxError) {
+      maxError = error;
+    }
+  }
+  return maxError <= tolerance ? ring : null;
+}
+
+/**
+ * 대상 꼭지점을 하나씩 독립적으로 처리.
+ * 각 꼭지점 처리 후 즉시 polygon에 반영하여
+ * 다음 꼭지점 처리 시 갱신된 좌표를 사용한다.
+ */
+export function adjustPolygonAnglesToRight(
+  vectorSource: VectorSource<Feature<Polygon>>,
+  minAngle: number,
+  maxAngle: number
+): AngleAdjustResult {
+  const normalizedMin = Math.max(0, Math.min(360, minAngle));
+  const normalizedMax = Math.max(0, Math.min(360, maxAngle));
+  const rangeMin = Math.min(normalizedMin, normalizedMax);
+  const rangeMax = Math.max(normalizedMin, normalizedMax);
+
+  let updatedPolygons = 0;
+  let updatedVertices = 0;
+
+  for (const feature of vectorSource.getFeatures()) {
+    const geometry = feature.getGeometry();
+    if (!geometry || geometry.getType() !== "Polygon") {
+      continue;
+    }
+
+    const polygon = geometry as Polygon;
+
+    const initialRing5179 = getRingWithoutClosure5179(polygon);
+    if (initialRing5179.length < 3) {
+      continue;
+    }
+
+    // 초기 링 기준으로 타깃 인덱스 수집
+    const targetIndices = collectTargetVertexIndices(initialRing5179, rangeMin, rangeMax);
+    if (targetIndices.length === 0) {
+      continue;
+    }
+
+    let featureUpdated = false;
+
+    for (const targetIndex of targetIndices) {
+      // 매 꼭지점 처리 전 현재 링을 다시 읽음
+      const currentRing5179 = getRingWithoutClosure5179(polygon);
+
+      const angle = getAngleAtIndex(currentRing5179, targetIndex);
+      if (angle === null) {
+        continue;
+      }
+
+      // 처리 시점의 실제 각도로 범위 재확인
+      const interior = angle;
+      const exterior = 360 - angle;
+      const inTarget =
+        inRange(interior, rangeMin, rangeMax) || inRange(exterior, rangeMin, rangeMax);
+      if (!inTarget) {
+        continue;
+      }
+
+      const solvedRing5179 =
+        solveRightAngleConstraints(currentRing5179, [targetIndex], TARGET_TOLERANCE) ??
+        fallbackIterativeAdjust(currentRing5179, [targetIndex], TARGET_TOLERANCE);
+
+      if (!solvedRing5179) {
+        continue;
+      }
+
+      // 즉시 polygon에 반영
+      const solvedRing3857 = solvedRing5179.map(to3857);
+      polygon.setCoordinates([createClosedRing(solvedRing3857)]);
+
+      featureUpdated = true;
+      updatedVertices += 1;
+    }
+
+    if (featureUpdated) {
+      updatedPolygons += 1;
+    }
+  }
+
+  if (updatedPolygons > 0) {
+    vectorSource.changed();
+  }
+
+  return { updatedPolygons, updatedVertices };
+}
+
+// 아래 함수는 buildVariableIndexMap 으로 솔버에서만 쓰였으나
+// 새 solveRightAngleConstraints 에서 더 이상 사용하지 않으므로 삭제해도 무방합니다.
+// function buildVariableIndexMap(...) { ... }
