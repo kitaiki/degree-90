@@ -1,0 +1,309 @@
+import type { Coordinate } from "ol/coordinate";
+import type Feature from "ol/Feature";
+import type Polygon from "ol/geom/Polygon";
+import VectorSource from "ol/source/Vector";
+
+/**
+ * ✅ 완성본(v3): "신규 알고리즘" (기존 solver/fallback/jacobian 전혀 사용 안 함)
+ * - EPSG:5179에서 각도 계산/보정
+ * - 대상 꼭지점만 이동(이웃 고정)
+ * - 오목각 포함(0~360 내각)
+ * - Thales 원(AC 지름 원) 위에서 "최소 이동 + 길이변화 억제 + 턴(오목/볼록) 보존" 후보 선택
+ * - 댐핑(alpha)으로 과도한 이동/스케일 드리프트 방지
+ *
+ * ⚠️ 전제:
+ * - 프로젝트에 이미 존재하는 to5179 / to3857 변환 함수가 스코프에 있어야 함.
+ *   (질문에서 주신 코드의 to5179/to3857 그대로 사용)
+ */
+
+function getRingWithoutClosure(polygon: Polygon): Coordinate[] {
+  const outerRing = polygon.getCoordinates()[0] ?? [];
+  if (outerRing.length < 2) return [...outerRing];
+
+  const first = outerRing[0];
+  const last = outerRing[outerRing.length - 1];
+  const isClosed = first[0] === last[0] && first[1] === last[1];
+  return isClosed ? outerRing.slice(0, -1) : [...outerRing];
+}
+
+function createClosedRing(ring: Coordinate[]): Coordinate[] {
+  if (ring.length === 0) return [];
+  return [...ring, [...ring[0]]];
+}
+
+function ringIsCCW(ring: Coordinate[]): boolean {
+  let area2 = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i];
+    const b = ring[(i + 1) % ring.length];
+    area2 += a[0] * b[1] - b[0] * a[1];
+  }
+  return area2 > 0;
+}
+
+function interiorAngle360(prev: Coordinate, cur: Coordinate, next: Coordinate, isCCW: boolean): number | null {
+  const bax = prev[0] - cur[0];
+  const bay = prev[1] - cur[1];
+  const bcx = next[0] - cur[0];
+  const bcy = next[1] - cur[1];
+
+  const baLen = Math.hypot(bax, bay);
+  const bcLen = Math.hypot(bcx, bcy);
+  if (baLen === 0 || bcLen === 0) return null;
+
+  const dot = bax * bcx + bay * bcy;
+  const cross = bax * bcy - bay * bcx;
+
+  // 0~180
+  const base = (Math.atan2(Math.abs(cross), dot) * 180) / Math.PI;
+
+  // reflex 판정(일반 simple polygon 가정)
+  const isReflex = isCCW ? cross < 0 : cross > 0;
+  const interior = isReflex ? 360 - base : base;
+
+  return Number.isFinite(interior) ? interior : null;
+}
+
+function inRange(value: number, min: number, max: number): boolean {
+  return value >= min && value <= max;
+}
+
+function pickBestCandidate(
+  prev: Coordinate,
+  cur: Coordinate,
+  next: Coordinate,
+  candidates: Coordinate[],
+  wantTurnSign: number,
+  lengthPenaltyWeight: number
+): Coordinate | null {
+  const origLen1 = Math.hypot(cur[0] - prev[0], cur[1] - prev[1]);
+  const origLen2 = Math.hypot(next[0] - cur[0], next[1] - cur[1]);
+
+  const turnSign = (b: Coordinate) => {
+    const v1x = b[0] - prev[0],
+      v1y = b[1] - prev[1];
+    const v2x = next[0] - b[0],
+      v2y = next[1] - b[1];
+    return Math.sign(v1x * v2y - v1y * v2x);
+  };
+
+  let best: Coordinate | null = null;
+  let bestCost = Number.POSITIVE_INFINITY;
+
+  for (const b of candidates) {
+    const s = turnSign(b);
+    const okTurn = wantTurnSign === 0 || s === wantTurnSign;
+
+    const len1 = Math.hypot(b[0] - prev[0], b[1] - prev[1]);
+    const len2 = Math.hypot(next[0] - b[0], next[1] - b[1]);
+    const dMove = Math.hypot(b[0] - cur[0], b[1] - cur[1]);
+    const dLen = (len1 - origLen1) ** 2 + (len2 - origLen2) ** 2;
+
+    // 비용: 이동 최소 + 길이 변화 패널티 + 턴 불일치 대패널티
+    const cost = dMove * dMove + lengthPenaltyWeight * dLen + (okTurn ? 0 : 1e6);
+
+    if (cost < bestCost) {
+      bestCost = cost;
+      best = b;
+    }
+  }
+
+  return best;
+}
+
+/**
+ * A(prev), C(next)를 고정하고 B를 움직여 ∠ABC=90°를 만족하는 점을 찾는다.
+ * - Thales 원: 중심 mid(AC), 반지름 |AC|/2
+ * - 원 위의 모든 점이 90°를 만족하므로,
+ *   "현재 B에서 최소 이동"이 되는 투영방향(theta0)을 중심으로 주변 탐색하여
+ *   (턴 방향 유지 + 길이 변화 최소) 후보를 선택한다.
+ */
+function moveBToRightAngleStable(
+  prev: Coordinate,
+  cur: Coordinate,
+  next: Coordinate,
+  wantTurnSign: number,
+  sampleCount: number,
+  sampleSpanRad: number,
+  lengthPenaltyWeight: number
+): Coordinate | null {
+  const ax = prev[0],
+    ay = prev[1];
+  const cx = next[0],
+    cy = next[1];
+
+  const mx = (ax + cx) / 2;
+  const my = (ay + cy) / 2;
+
+  const acLen = Math.hypot(cx - ax, cy - ay);
+  if (acLen === 0) return null;
+
+  const r = acLen / 2;
+
+  const vx = cur[0] - mx;
+  const vy = cur[1] - my;
+  const vLen = Math.hypot(vx, vy);
+
+  // current가 중심과 같으면 방향이 없으므로 수직 후보 2개
+  if (vLen === 0) {
+    const ux = -(cy - ay) / acLen;
+    const uy = (cx - ax) / acLen;
+    const c1: Coordinate = [mx + ux * r, my + uy * r];
+    const c2: Coordinate = [mx - ux * r, my - uy * r];
+    return pickBestCandidate(prev, cur, next, [c1, c2], wantTurnSign, lengthPenaltyWeight);
+  }
+
+  // ✅ 최소이동 투영: 현재 방향(theta0)으로 원 위 점
+  const theta0 = Math.atan2(vy, vx);
+
+  // 주변만 탐색(너무 넓히면 튐/커짐)
+  const candidates: Coordinate[] = [];
+  const K = Math.max(5, sampleCount);
+
+  for (let i = 0; i < K; i++) {
+    const t = -sampleSpanRad + (2 * sampleSpanRad * i) / (K - 1);
+    const th = theta0 + t;
+    candidates.push([mx + Math.cos(th) * r, my + Math.sin(th) * r]);
+  }
+
+  return pickBestCandidate(prev, cur, next, candidates, wantTurnSign, lengthPenaltyWeight);
+}
+
+/** 선택된 후보로 "부분 이동(댐핑)" 적용 */
+function dampedMove(cur: Coordinate, target: Coordinate, alpha: number): Coordinate {
+  return [cur[0] + (target[0] - cur[0]) * alpha, cur[1] + (target[1] - cur[1]) * alpha];
+}
+
+/**
+ * ✅ 최종 공개 함수
+ */
+export function adjustPolygonAnglesToRight_v3(
+  vectorSource: VectorSource<Feature<Polygon>>,
+  minAngle: number,
+  maxAngle: number,
+  options?: {
+    targetAngle?: number; // 기본 90
+    toleranceDeg?: number; // 기본 0.2
+    maxIterations?: number; // 기본 40
+
+    // 안정화 파라미터
+    alpha?: number; // 댐핑(0~1): 기본 0.35
+    sampleCount?: number; // 원 위 탐색 샘플 수: 기본 24
+    sampleSpanDeg?: number; // 탐색 범위(+/-): 기본 90
+    lengthPenaltyWeight?: number; // 변 길이 변화 패널티 가중치: 기본 0.25
+  }
+): { updatedPolygons: number; updatedVertices: number } {
+  const targetAngle = options?.targetAngle ?? 90;
+  const tolerance = options?.toleranceDeg ?? 0.2;
+  const maxIterations = options?.maxIterations ?? 40;
+
+  const alpha = options?.alpha ?? 0.35;
+  const sampleCount = options?.sampleCount ?? 24;
+  const sampleSpanRad = ((options?.sampleSpanDeg ?? 90) * Math.PI) / 180;
+  const lengthPenaltyWeight = options?.lengthPenaltyWeight ?? 0.25;
+
+  const rangeMin = Math.min(Math.max(0, minAngle), Math.max(0, maxAngle));
+  const rangeMax = Math.max(Math.max(0, minAngle), Math.max(0, maxAngle));
+
+  let updatedPolygons = 0;
+  let updatedVertices = 0;
+
+  for (const feature of vectorSource.getFeatures()) {
+    const geom = feature.getGeometry();
+    if (!geom || geom.getType() !== "Polygon") continue;
+
+    const polygon = geom as Polygon;
+
+    const ring3857 = getRingWithoutClosure(polygon);
+    if (ring3857.length < 3) continue;
+
+    // ⚠️ 프로젝트에 존재하는 좌표 변환 함수 사용
+    // @ts-ignore
+    let ring: Coordinate[] = ring3857.map(to5179);
+
+    let polygonChanged = false;
+
+    for (let iter = 0; iter < maxIterations; iter++) {
+      const isCCW = ringIsCCW(ring);
+
+      // 매 반복마다 타깃 재선정(연쇄 변형에 대응)
+      const targets: number[] = [];
+      let maxErr = 0;
+
+      for (let i = 0; i < ring.length; i++) {
+        const prev = ring[(i - 1 + ring.length) % ring.length];
+        const cur = ring[i];
+        const next = ring[(i + 1) % ring.length];
+
+        const ang = interiorAngle360(prev, cur, next, isCCW);
+        if (ang == null) continue;
+
+        const ext = 360 - ang;
+        const isTarget = inRange(ang, rangeMin, rangeMax) || inRange(ext, rangeMin, rangeMax);
+        if (isTarget) targets.push(i);
+
+        // 전체 오차(타깃만)
+        if (isTarget) {
+          const err = Math.abs(ang - targetAngle);
+          if (err > maxErr) maxErr = err;
+        }
+      }
+
+      if (targets.length === 0) break;
+      if (maxErr <= tolerance) break;
+
+      let movedThisIter = false;
+
+      // 타깃 점만 순차 보정 (이웃 고정)
+      for (const i of targets) {
+        const prev = ring[(i - 1 + ring.length) % ring.length];
+        const cur = ring[i];
+        const next = ring[(i + 1) % ring.length];
+
+        const ang = interiorAngle360(prev, cur, next, isCCW);
+        if (ang == null) continue;
+
+        const err = Math.abs(ang - targetAngle);
+        if (err <= tolerance) continue;
+
+        // 오목/볼록(턴) 부호 힌트
+        const v1x = cur[0] - prev[0],
+          v1y = cur[1] - prev[1];
+        const v2x = next[0] - cur[0],
+          v2y = next[1] - cur[1];
+        const wantTurnSign = Math.sign(v1x * v2y - v1y * v2x);
+
+        const candidate = moveBToRightAngleStable(
+          prev,
+          cur,
+          next,
+          wantTurnSign,
+          sampleCount,
+          sampleSpanRad,
+          lengthPenaltyWeight
+        );
+        if (!candidate) continue;
+
+        // ✅ 댐핑 이동(커짐/튐 방지)
+        ring[i] = dampedMove(cur, candidate, alpha);
+
+        movedThisIter = true;
+        polygonChanged = true;
+        updatedVertices += 1;
+      }
+
+      if (!movedThisIter) break;
+    }
+
+    if (!polygonChanged) continue;
+
+    // 3857로 되돌려 적용
+    // @ts-ignore
+    const solved3857 = ring.map(to3857);
+    polygon.setCoordinates([createClosedRing(solved3857)]);
+    updatedPolygons += 1;
+  }
+
+  if (updatedPolygons > 0) vectorSource.changed();
+  return { updatedPolygons, updatedVertices };
+}
