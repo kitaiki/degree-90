@@ -1,0 +1,79 @@
+export function adjustPolygonAnglesToRight(
+  vectorSource: VectorSource<Feature<Polygon>>,
+  minAngle: number,
+  maxAngle: number
+): AngleAdjustResult {
+  const normalizedMin = Math.max(0, Math.min(360, minAngle));
+  const normalizedMax = Math.max(0, Math.min(360, maxAngle));
+  const rangeMin = Math.min(normalizedMin, normalizedMax);
+  const rangeMax = Math.max(normalizedMin, normalizedMax);
+
+  let updatedPolygons = 0;
+  let updatedVertices = 0;
+
+  for (const feature of vectorSource.getFeatures()) {
+    const geometry = feature.getGeometry();
+    if (!geometry || geometry.getType() !== "Polygon") {
+      continue;
+    }
+
+    const polygon = geometry as Polygon;
+
+    // ✅ 최초 타깃 인덱스는 초기 링 기준으로 수집
+    const initialRing5179 = getRingWithoutClosure5179(polygon);
+    if (initialRing5179.length < 3) {
+      continue;
+    }
+
+    const targetIndices = collectTargetVertexIndices(initialRing5179, rangeMin, rangeMax);
+    if (targetIndices.length === 0) {
+      continue;
+    }
+
+    let featureUpdated = false;
+
+    // ✅ 대상 꼭지점을 하나씩 독립적으로 처리
+    for (const targetIndex of targetIndices) {
+      // 매 꼭지점 처리 전 현재 링을 다시 읽음 (앞 꼭지점 이동 결과 반영)
+      const currentRing5179 = getRingWithoutClosure5179(polygon);
+
+      const angle = getAngleAtIndex(currentRing5179, targetIndex);
+      if (angle === null) {
+        continue;
+      }
+
+      // ✅ 처리 시점의 실제 각도로 범위 재확인
+      const interior = angle;
+      const exterior = 360 - angle;
+      const inTarget = inRange(interior, rangeMin, rangeMax) || inRange(exterior, rangeMin, rangeMax);
+      if (!inTarget) {
+        continue;
+      }
+
+      const solvedRing5179 =
+        solveRightAngleConstraints(currentRing5179, [targetIndex], TARGET_TOLERANCE) ??
+        fallbackIterativeAdjust(currentRing5179, [targetIndex], TARGET_TOLERANCE);
+
+      if (!solvedRing5179) {
+        continue;
+      }
+
+      // ✅ 즉시 polygon에 반영 (다음 꼭지점 처리 시 반영된 좌표 사용)
+      const solvedRing3857 = solvedRing5179.map(to3857);
+      polygon.setCoordinates([createClosedRing(solvedRing3857)]);
+
+      featureUpdated = true;
+      updatedVertices += 1;
+    }
+
+    if (featureUpdated) {
+      updatedPolygons += 1;
+    }
+  }
+
+  if (updatedPolygons > 0) {
+    vectorSource.changed();
+  }
+
+  return { updatedPolygons, updatedVertices };
+}
